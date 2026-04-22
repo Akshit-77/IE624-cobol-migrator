@@ -139,10 +139,11 @@ Stdout:
 ## Your Task
 1. FIRST: Determine if the bug is in the translation OR in the test code itself
    - Test code bugs: NameError in test file, missing imports in test, test logic errors
-   - Translation bugs: Wrong output, wrong behavior, missing COBOL functionality
+   - **Test expected value bugs**: Test asserts wrong expected value (calculation error)
    - **Mock data format bugs**: Test creates mock files with wrong format (spaces between fields)
+   - Translation bugs: Wrong output, wrong behavior, missing COBOL functionality
    
-2. If it's a TEST CODE bug (like NameError: capsys not defined):
+2. If it's a TEST CODE bug (like NameError, wrong expected value, bad mock data):
    - Recommend GEN_TESTS to regenerate the tests
    - The lesson should describe the test code fix needed
    - Note: pytest fixtures like `capsys` must be PARAMETERS to test functions, not imports
@@ -152,6 +153,24 @@ Stdout:
    - The lesson should describe how to fix the translation
 
 4. If the code is fundamentally correct but tests are too strict: recommend FINISH
+
+## IMPORTANT: Test Expected Value Errors (VERY COMMON)
+If the test fails with an assertion like:
+  `assert 'TOTAL AMOUNT,2250.00' in content`
+  `AssertionError: ... assert 'TOTAL AMOUNT,2250.00' in '...TOTAL AMOUNT,2750.00...'`
+
+And the ACTUAL output (2750.00) is MATHEMATICALLY CORRECT based on the input data,
+then the TEST has the wrong expected value - the translation is correct!
+
+**How to verify**: Calculate the expected value from the mock input data manually.
+If the code's output matches the correct calculation but not the test assertion,
+it's a TEST BUG, not a translation bug. Recommend GEN_TESTS.
+
+Example:
+- Mock data: 500 + 1500 + 750 = 2750 (correct)
+- Code outputs: 2750.00 (correct!)
+- Test expects: 2250.00 (WRONG - test has arithmetic error)
+- Recommendation: GEN_TESTS (fix the test's expected value)
 
 ## IMPORTANT: COBOL Fixed-Width Record Format
 COBOL records are FIXED-WIDTH with NO separators between fields!
@@ -175,6 +194,8 @@ Examples of good lessons:
 - "Test code bug: Test expects exact match but COBOL output has trailing spaces"
 - "Test code bug: Mock data has spaces between fields - COBOL uses fixed-width"
 - "Translation bug: COBOL PIC 9(3)V99 means divide by 100 for implied decimal"
+- "Test code bug: Test expects 2250 but correct sum of inputs is 2750 - wrong expected value"
+- "Test code bug: Test has arithmetic error in expected value - recalculate from mock data"
 
 Examples of bad lessons:
 - "The code has a bug" (not actionable)

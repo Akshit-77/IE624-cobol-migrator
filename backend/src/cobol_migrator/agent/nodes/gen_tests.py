@@ -139,6 +139,50 @@ def test_output_file_content(tmp_path, monkeypatch):
     assert "expected content" in output
 ```
 
+## CRITICAL: VERIFY EXPECTED VALUES BY CALCULATING THEM
+
+When asserting expected output values (totals, sums, counts, etc.):
+1. **MANUALLY CALCULATE** the expected value from your mock input data
+2. **SHOW YOUR WORK** - add a comment showing the calculation
+3. **DOUBLE-CHECK ARITHMETIC** - mistakes here cause test failures!
+
+**EXAMPLE - Calculating expected totals:**
+```python
+def test_output_file_content(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    
+    # Create input with known values
+    input_file = tmp_path / "ORDERS.DAT"
+    input_file.write_text(
+        "0001000000123400100050000\\n"  # Amount: 500.00
+        "0002000000123400200150000\\n"  # Amount: 1500.00
+        "0003000000123400300075000\\n"  # Amount: 750.00
+    )
+    
+    main()
+    
+    content = (tmp_path / "ANALYSIS.CSV").read_text()
+    
+    # Calculate expected total: 500.00 + 1500.00 + 750.00 = 2750.00
+    # VERIFY: 500 + 1500 = 2000, 2000 + 750 = 2750 ✓
+    assert "TOTAL AMOUNT,2750.00" in content
+    assert "TOTAL ORDERS,3" in content  # 3 records
+```
+
+**WRONG - Guessing or miscalculating:**
+```python
+# DON'T DO THIS - the 2250 is wrong (should be 2750)
+assert "TOTAL AMOUNT,2250.00" in content  # WRONG!
+```
+
+**If calculation is complex, use partial assertions instead:**
+```python
+# When exact value is hard to compute, check format/presence instead
+assert "TOTAL AMOUNT," in content  # Just verify the line exists
+lines = content.strip().split("\\n")
+assert any(line.startswith("TOTAL AMOUNT,") for line in lines)
+```
+
 CRITICAL RULES:
 - NO subprocess - direct imports only
 - All fixtures (capsys, tmp_path, monkeypatch) MUST be function parameters
@@ -146,6 +190,8 @@ CRITICAL RULES:
 - Match the exact field positions from the COBOL PIC clauses
 - Keep tests simple and focused
 - **DO NOT use capsys for file-writing programs** - they don't print to stdout!
+- **ALWAYS calculate expected values from your input data - never guess!**
+- **Add comments showing your calculation to verify correctness**
 
 Generate a complete, working pytest test file.
 """
