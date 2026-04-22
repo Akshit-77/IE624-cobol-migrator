@@ -220,12 +220,65 @@ def _build_external_deps_context(state: AgentState) -> str:
     return "No external dependency issues detected"
 
 
+def _count_gen_tests_for_draft(state: AgentState) -> int:
+    """Count how many times GEN_TESTS was called for the current draft."""
+    history = state.get("tool_call_history", [])
+    current_draft_id = state.get("current_draft_id")
+    
+    if not current_draft_id:
+        return 0
+    
+    # Count GEN_TESTS calls since the last TRANSLATE
+    gen_tests_count = 0
+    for tc in reversed(history):
+        if tc.name == "TRANSLATE":
+            break
+        if tc.name == "GEN_TESTS":
+            gen_tests_count += 1
+    
+    return gen_tests_count
+
+
+def _should_force_translate(state: AgentState) -> tuple[bool, str]:
+    """
+    Check if we should force a TRANSLATE instead of allowing GEN_TESTS.
+    Returns (should_force, reason).
+    """
+    gen_tests_count = _count_gen_tests_for_draft(state)
+    test_runs = state.get("test_runs", [])
+    current_draft_id = state.get("current_draft_id")
+    
+    # Count failed test runs for current draft
+    failed_runs = sum(
+        1 for r in test_runs 
+        if r.draft_id == current_draft_id and not r.passed
+    )
+    
+    # If we've generated tests 2+ times for this draft and still failing, force translate
+    if gen_tests_count >= 2 and failed_runs >= 2:
+        return True, f"GEN_TESTS called {gen_tests_count}x with {failed_runs} failures - need new translation"
+    
+    # If we've had 3+ consecutive test failures across all drafts, consider translate
+    recent_failures = 0
+    for run in reversed(test_runs[-5:]):
+        if not run.passed:
+            recent_failures += 1
+        else:
+            break
+    
+    if recent_failures >= 3 and gen_tests_count >= 1:
+        return True, f"{recent_failures} consecutive test failures - new translation needed"
+    
+    return False, ""
+
+
 def planner(state: AgentState) -> dict[str, Any]:
     """
     The planner node: decides what action to take next.
     
     Uses structured LLM output to select the next action with reasoning.
     Incorporates program summary, I/O contract, lessons learned, and history.
+    Includes hardcoded rules to prevent excessive API calls from test regeneration loops.
     """
     emit = state.get("emit", lambda t, p: None)
 
@@ -246,6 +299,25 @@ def planner(state: AgentState) -> dict[str, Any]:
         return {
             "next_action": "FINISH",
             "plan": f"Finishing due to external dependency: {resource}",
+        }
+    
+    # Check if we're stuck in a test loop - force translate if so
+    should_translate, translate_reason = _should_force_translate(state)
+    if should_translate:
+        logger.info(f"Forcing TRANSLATE: {translate_reason}")
+        emit(
+            "planner_decision",
+            {
+                "reasoning": translate_reason,
+                "next_action": "TRANSLATE",
+                "target_draft_id": None,
+                "step_count": state.get("step_count", 0),
+                "forced": True,
+            },
+        )
+        return {
+            "next_action": "TRANSLATE",
+            "plan": translate_reason,
         }
 
     program_context = _build_program_context(state)
@@ -278,6 +350,17 @@ def planner(state: AgentState) -> dict[str, Any]:
             next_action="FINISH",
             target_draft_id=None,
         )
+
+    # Post-LLM override: prevent excessive GEN_TESTS
+    if decision.next_action == "GEN_TESTS":
+        gen_tests_count = _count_gen_tests_for_draft(state)
+        if gen_tests_count >= 2:
+            logger.info(f"Overriding GEN_TESTS -> TRANSLATE (already {gen_tests_count} attempts)")
+            decision = PlannerDecision(
+                reasoning=f"Override: Already tried GEN_TESTS {gen_tests_count}x, need new translation",
+                next_action="TRANSLATE",
+                target_draft_id=None,
+            )
 
     emit(
         "planner_decision",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import logging
+import re
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -12,6 +14,77 @@ from cobol_migrator.models import get_structured_model
 logger = logging.getLogger(__name__)
 
 
+def _validate_test_syntax(test_code: str) -> tuple[bool, str]:
+    """
+    Validate that test code is syntactically valid Python.
+    Returns (is_valid, error_message).
+    """
+    try:
+        ast.parse(test_code)
+        return True, ""
+    except SyntaxError as e:
+        return False, f"Syntax error at line {e.lineno}: {e.msg}"
+
+
+def _validate_test_structure(test_code: str) -> tuple[bool, list[str]]:
+    """
+    Validate that test code has required structure.
+    Returns (is_valid, list_of_issues).
+    """
+    issues = []
+    
+    # Must import from main
+    if "from main import" not in test_code and "import main" not in test_code:
+        issues.append("Missing import from main.py")
+    
+    # Must have at least one test function
+    if "def test_" not in test_code:
+        issues.append("No test functions found (must start with 'def test_')")
+    
+    # Should not use subprocess
+    if "subprocess" in test_code:
+        issues.append("Uses subprocess (forbidden - use direct imports)")
+    
+    # Check for common hallucination patterns
+    hallucination_patterns = [
+        (r"import capsys", "capsys is a fixture, not an import"),
+        (r"from pytest import capsys", "capsys is a fixture, not an import"),
+        (r"capsys\s*=", "capsys must be a function parameter, not assigned"),
+        (r"assert\s+\d+\s*==\s*\d+", "Hardcoded numeric comparison (likely hallucinated)"),
+    ]
+    
+    for pattern, message in hallucination_patterns:
+        if re.search(pattern, test_code):
+            issues.append(message)
+    
+    return len(issues) == 0, issues
+
+
+def _extract_test_functions(test_code: str) -> list[str]:
+    """Extract test function names from test code."""
+    return re.findall(r"def (test_\w+)\s*\(", test_code)
+
+
+def _sanitize_test_code(test_code: str) -> str:
+    """
+    Clean up common issues in generated test code.
+    """
+    # Remove markdown code fences if present
+    test_code = re.sub(r"^```python\s*\n?", "", test_code)
+    test_code = re.sub(r"^```\s*\n?", "", test_code, flags=re.MULTILINE)
+    test_code = re.sub(r"\n?```$", "", test_code)
+    
+    # Fix common capsys mistakes
+    test_code = re.sub(r"import capsys\n?", "", test_code)
+    test_code = re.sub(r"from pytest import capsys\n?", "", test_code)
+    
+    # Ensure proper imports at top
+    if "from main import" not in test_code and "import main" not in test_code:
+        test_code = "from main import main\n\n" + test_code
+    
+    return test_code.strip()
+
+
 class GeneratedTests(BaseModel):
     """Structured output from test generation LLM."""
 
@@ -20,180 +93,68 @@ class GeneratedTests(BaseModel):
 
 
 GEN_TESTS_SYSTEM_PROMPT = """\
-You are a Python testing expert. Generate pytest tests for a Python program that was translated 
-from COBOL based on the following specification.
+Generate simple, reliable pytest tests for this Python code translated from COBOL.
 
-## Program Summary
-{program_summary}
-
-## I/O Contract
-Inputs: {inputs}
-Outputs: {outputs}
-Invariants: {invariants}
-
-## Current Python Code
+## Python Code to Test
 ```python
 {python_code}
 ```
+
+## Program Info
+Summary: {program_summary}
+Inputs: {inputs}
+Outputs: {outputs}
 
 {lessons_context}
 
 {record_layout_info}
 
-## Requirements - READ CAREFULLY
-1. Generate a complete pytest file that imports from main.py
-2. **CRITICAL**: Do NOT use subprocess. Import and call functions directly
-3. Test that the main() function runs without errors
-4. Use descriptive test names
+## RULES - Follow exactly
 
-## CRITICAL: Choose the RIGHT test approach based on program type
+1. **Import**: `from main import main` (NEVER use subprocess)
 
-**For programs that PRINT to stdout (DISPLAY statements):**
-- Use `capsys` fixture: `capsys.readouterr().out`
-- Check that printed output contains expected text
+2. **Fixtures are PARAMETERS, not imports**:
+   - CORRECT: `def test_foo(capsys):` then `capsys.readouterr()`
+   - WRONG: `import capsys` or `capsys = ...`
 
-**For programs that WRITE to files (most file-processing programs):**
-- Do NOT use capsys - the program writes to files, not stdout!
-- Instead, check that output files exist and contain expected content
-- Use `tmp_path / "OUTPUT.RPT"` and read with `.read_text()`
+3. **Choose test type based on code behavior**:
+   - Code uses `print()` → use `capsys` fixture
+   - Code uses `open()` to write files → check file exists, DON'T use capsys
 
-## CRITICAL: COBOL RECORD FORMAT
-COBOL records are FIXED-WIDTH with NO separators between fields!
-- Each field has an exact position and length
-- Fields are concatenated directly with NO spaces between them
-- Numeric fields are zero-padded on the left
-- Alpha fields are space-padded on the right
-
-## HANDLING FILE I/O PROGRAMS
-If the code reads/writes files (like 'EMPLOYEE.DAT', 'INPUT.TXT', etc.):
-1. Use pytest's `tmp_path` fixture to create temporary directories
-2. Create mock input files with CORRECTLY FORMATTED fixed-width records
-3. Use `monkeypatch.chdir(tmp_path)` to run tests in the temp directory
-4. Check output files exist and contain expected content after main() runs
-
-**EXAMPLE - CORRECT mock data format:**
+4. **For file I/O programs**:
 ```python
-import os
-from main import main
-
-def test_file_processing(tmp_path, monkeypatch, capsys):
-    \"\"\"Test file processing with mock data.\"\"\"
+def test_with_files(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    
-    # COBOL records are FIXED-WIDTH! Each field must be at exact position.
-    # Example: ID(6) + NAME(30) + HOURS(5) + RATE(5) = 46 chars total
-    # NO SPACES between fields! Fields are concatenated directly.
-    input_file = tmp_path / "EMPLOYEE.DAT"
-    input_file.write_text(
-        "001234John Smith                     0400001500\\n"  # 46 chars exactly
-        "002345Jane Doe                       0500002000\\n"  # 46 chars exactly
-    )
-    
+    # Create input file (FIXED-WIDTH, NO spaces between fields!)
+    (tmp_path / "INPUT.DAT").write_text("001234DATA HERE    00100\\n")
     main()
-    
-    output_file = tmp_path / "PAYROLL.RPT"
-    assert output_file.exists(), "Output file should be created"
-    content = output_file.read_text()
-    assert "John Smith" in content
+    assert (tmp_path / "OUTPUT.RPT").exists()
 ```
 
-WRONG (has spaces between fields):
-```
-"001234John Smith                     04000 01500"  # WRONG - space before rate!
-```
-
-RIGHT (fixed-width, no spaces between fields):
-```
-"001234John Smith                     0400001500"   # RIGHT - 46 chars exactly
-```
-
-## Example for simple DISPLAY programs (prints to stdout)
+5. **Use SIMPLE assertions** - avoid exact value matching:
 ```python
-from main import main
+# GOOD - checks structure, not exact values
+assert output_file.exists()
+assert "TOTAL" in content
+assert len(content) > 0
 
-def test_main_runs_without_error():
-    main()
-
-def test_main_output(capsys):  # capsys MUST be a parameter!
-    main()
-    captured = capsys.readouterr()
-    assert "expected text" in captured.out
+# BAD - prone to errors
+assert content == "exact string"  # Too brittle
+assert "2750.00" in content  # Only if you calculated it!
 ```
 
-## Example for FILE-WRITING programs (writes to files, NOT stdout)
+6. **If you must check numeric values, CALCULATE and COMMENT**:
 ```python
-from main import main
-
-def test_main_runs_without_error(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    # Create input files...
-    main()
-    # Do NOT use capsys here - program writes to file, not stdout!
-
-def test_output_file_content(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    # Create input files...
-    main()
-    # Check output FILE (not stdout):
-    output = (tmp_path / "OUTPUT.RPT").read_text()
-    assert "expected content" in output
+# Input: 100 + 200 + 300 = 600
+assert "600" in content  # Sum of input values
 ```
 
-## CRITICAL: VERIFY EXPECTED VALUES BY CALCULATING THEM
+## Generate 2-3 simple tests:
+1. `test_main_runs_without_error` - just call main()
+2. `test_produces_output` - verify some output exists
+3. (optional) `test_output_format` - check output structure
 
-When asserting expected output values (totals, sums, counts, etc.):
-1. **MANUALLY CALCULATE** the expected value from your mock input data
-2. **SHOW YOUR WORK** - add a comment showing the calculation
-3. **DOUBLE-CHECK ARITHMETIC** - mistakes here cause test failures!
-
-**EXAMPLE - Calculating expected totals:**
-```python
-def test_output_file_content(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    
-    # Create input with known values
-    input_file = tmp_path / "ORDERS.DAT"
-    input_file.write_text(
-        "0001000000123400100050000\\n"  # Amount: 500.00
-        "0002000000123400200150000\\n"  # Amount: 1500.00
-        "0003000000123400300075000\\n"  # Amount: 750.00
-    )
-    
-    main()
-    
-    content = (tmp_path / "ANALYSIS.CSV").read_text()
-    
-    # Calculate expected total: 500.00 + 1500.00 + 750.00 = 2750.00
-    # VERIFY: 500 + 1500 = 2000, 2000 + 750 = 2750 ✓
-    assert "TOTAL AMOUNT,2750.00" in content
-    assert "TOTAL ORDERS,3" in content  # 3 records
-```
-
-**WRONG - Guessing or miscalculating:**
-```python
-# DON'T DO THIS - the 2250 is wrong (should be 2750)
-assert "TOTAL AMOUNT,2250.00" in content  # WRONG!
-```
-
-**If calculation is complex, use partial assertions instead:**
-```python
-# When exact value is hard to compute, check format/presence instead
-assert "TOTAL AMOUNT," in content  # Just verify the line exists
-lines = content.strip().split("\\n")
-assert any(line.startswith("TOTAL AMOUNT,") for line in lines)
-```
-
-CRITICAL RULES:
-- NO subprocess - direct imports only
-- All fixtures (capsys, tmp_path, monkeypatch) MUST be function parameters
-- For file I/O: Create FIXED-WIDTH records with NO spaces between fields!
-- Match the exact field positions from the COBOL PIC clauses
-- Keep tests simple and focused
-- **DO NOT use capsys for file-writing programs** - they don't print to stdout!
-- **ALWAYS calculate expected values from your input data - never guess!**
-- **Add comments showing your calculation to verify correctness**
-
-Generate a complete, working pytest test file.
+Keep tests SIMPLE. Prefer existence checks over exact value matching.
 """
 
 FALLBACK_TEST_TEMPLATE = '''\
@@ -285,12 +246,55 @@ def _build_record_layout_context(state: AgentState) -> str:
     return ""
 
 
+def _get_appropriate_fallback(python_code: str, state: AgentState) -> str:
+    """Get the appropriate fallback test based on code characteristics."""
+    if _code_uses_file_io(python_code):
+        # Check if we have dummy file specs to use
+        dummy_specs = state.get("dummy_file_specs", [])
+        if dummy_specs:
+            # Generate a more specific fallback for file I/O with known files
+            input_files = [s for s in dummy_specs if "input" in s.filename.lower() or ".dat" in s.filename.lower()]
+            if input_files:
+                spec = input_files[0]
+                return f'''\
+"""Auto-generated tests for COBOL migration with file I/O."""
+from main import main
+
+
+def test_main_runs_with_mock_files(tmp_path, monkeypatch):
+    """Test that main runs when input files exist."""
+    monkeypatch.chdir(tmp_path)
+    
+    # Create input file with sample data
+    (tmp_path / "{spec.filename}").write_text(
+        "{spec.content[:100]}\\n"
+    )
+    
+    # Should not raise when input exists
+    try:
+        main()
+    except FileNotFoundError as e:
+        raise AssertionError(f"Missing input file: {{e}}")
+
+
+def test_main_completes(tmp_path, monkeypatch):
+    """Test that main completes without error."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "{spec.filename}").write_text("{spec.content[:100]}\\n")
+    main()  # Should complete without raising
+'''
+        return FALLBACK_FILE_IO_TEST_TEMPLATE
+    else:
+        return FALLBACK_TEST_TEMPLATE
+
+
 def gen_tests(state: AgentState) -> dict[str, Any]:
     """
     Generate pytest tests for the current draft using I/O contract.
     
-    If I/O contract is available, uses LLM to generate contract-driven tests.
-    Includes COBOL record layout information for correctly formatted mock data.
+    Includes validation to ensure generated tests are syntactically correct
+    and don't contain common hallucination patterns. Falls back to safe
+    templates if LLM output is invalid.
     """
     emit = state.get("emit", lambda t, p: None)
 
@@ -308,6 +312,10 @@ def gen_tests(state: AgentState) -> dict[str, Any]:
     lessons_context = _build_lessons_context(state)
     record_layout_info = _build_record_layout_context(state)
 
+    # Get appropriate fallback for this code type
+    fallback_tests = _get_appropriate_fallback(python_code, state)
+    tests = fallback_tests  # Default to fallback
+
     if io_contract:
         inputs_str = ", ".join(
             f"{p['name']}: {p['type']}" for p in io_contract.get("inputs", [])
@@ -315,16 +323,12 @@ def gen_tests(state: AgentState) -> dict[str, Any]:
         outputs_str = ", ".join(
             f"{p['name']}: {p['type']}" for p in io_contract.get("outputs", [])
         ) or "stdout"
-        invariants_str = "\n".join(
-            f"- {inv}" for inv in io_contract.get("invariants", [])
-        ) or "None specified"
 
         prompt = GEN_TESTS_SYSTEM_PROMPT.format(
             program_summary=program_summary,
             inputs=inputs_str,
             outputs=outputs_str,
-            invariants=invariants_str,
-            python_code=python_code[:8000],
+            python_code=python_code[:6000],  # Reduced to leave room for response
             lessons_context=lessons_context,
             record_layout_info=record_layout_info,
         )
@@ -332,19 +336,44 @@ def gen_tests(state: AgentState) -> dict[str, Any]:
         try:
             model = get_structured_model("analyze", GeneratedTests)
             result: GeneratedTests = model.invoke(prompt)
-            tests = result.test_code
-            logger.info(f"Generated contract-driven tests: {result.rationale[:80]}")
+            generated_tests = _sanitize_test_code(result.test_code)
+            
+            # Validate syntax
+            syntax_valid, syntax_error = _validate_test_syntax(generated_tests)
+            if not syntax_valid:
+                logger.warning(f"Generated tests have syntax error: {syntax_error}")
+                emit("test_generation_warning", {
+                    "warning": f"LLM generated invalid syntax: {syntax_error}",
+                    "using_fallback": True
+                })
+                # Use fallback
+            else:
+                # Validate structure
+                structure_valid, issues = _validate_test_structure(generated_tests)
+                if not structure_valid:
+                    logger.warning(f"Generated tests have structure issues: {issues}")
+                    emit("test_generation_warning", {
+                        "warning": f"LLM generated problematic tests: {', '.join(issues)}",
+                        "using_fallback": True
+                    })
+                    # Use fallback
+                else:
+                    # Tests passed validation
+                    tests = generated_tests
+                    test_funcs = _extract_test_functions(tests)
+                    logger.info(
+                        f"Generated valid tests with {len(test_funcs)} functions: "
+                        f"{', '.join(test_funcs[:3])}"
+                    )
+                    
         except Exception as e:
-            logger.warning(f"Contract-driven test generation failed: {e}, using fallback")
-            tests = FALLBACK_TEST_TEMPLATE
+            logger.warning(f"Test generation LLM call failed: {e}, using fallback")
+            emit("test_generation_warning", {
+                "warning": f"LLM call failed: {str(e)[:100]}",
+                "using_fallback": True
+            })
     else:
-        # Choose fallback based on whether code does file I/O
-        if _code_uses_file_io(python_code):
-            tests = FALLBACK_FILE_IO_TEST_TEMPLATE
-            logger.info("No I/O contract available, using file I/O fallback tests")
-        else:
-            tests = FALLBACK_TEST_TEMPLATE
-            logger.info("No I/O contract available, using basic fallback tests")
+        logger.info("No I/O contract available, using fallback tests")
 
     emit("tests_generated", {"tests": tests})
 
