@@ -90,6 +90,26 @@ IMPORT_TO_PACKAGE = {
     "sqlalchemy": "sqlalchemy",
     "pytest": "pytest",
     "hypothesis": "hypothesis",
+    # Database connectors - use pure Python or binary versions where possible
+    "mariadb": "mysql-connector-python",  # mariadb requires libmariadb-dev
+    "mysql": "mysql-connector-python",
+    "pymysql": "PyMySQL",
+    "pg8000": "pg8000",  # pure Python PostgreSQL
+    "sqlite3": None,  # stdlib, no install needed
+    "cx_Oracle": "oracledb",  # oracledb is pure Python alternative
+}
+
+# Packages that require system dependencies and their pure-Python alternatives
+# If the alternative is None, we skip installation (it requires system libs)
+PACKAGES_WITH_SYSTEM_DEPS = {
+    "mariadb": "mysql-connector-python",  # Pure Python MySQL/MariaDB connector
+    "mysqlclient": "PyMySQL",  # Pure Python alternative
+    "psycopg2": "psycopg2-binary",  # Pre-compiled binary
+    "cx_Oracle": "oracledb",  # Pure Python Oracle driver
+    "pyodbc": None,  # Requires unixODBC - skip
+    "pymssql": None,  # Requires FreeTDS - skip
+    "greenlet": "greenlet",  # Usually works but sometimes needs compiler
+    "lxml": "lxml",  # Usually has wheels
 }
 
 
@@ -241,6 +261,53 @@ def _create_venv(venv_dir: Path) -> Path:
     return python_path
 
 
+def _substitute_problematic_packages(packages: list[str]) -> list[str]:
+    """
+    Replace packages that need system dependencies with pure-Python alternatives.
+    """
+    result = []
+    for pkg in packages:
+        pkg_lower = pkg.lower()
+        if pkg_lower in PACKAGES_WITH_SYSTEM_DEPS:
+            alternative = PACKAGES_WITH_SYSTEM_DEPS[pkg_lower]
+            if alternative:
+                logger.info(f"Substituting {pkg} with {alternative} (pure Python alternative)")
+                result.append(alternative)
+            else:
+                logger.warning(f"Skipping {pkg} - requires system dependencies with no alternative")
+        else:
+            result.append(pkg)
+    return result
+
+
+def _install_single_package(
+    uv_path: str | None,
+    python_executable: Path,
+    package: str,
+    timeout: int = 60,
+) -> bool:
+    """Install a single package, return True if successful."""
+    try:
+        if uv_path:
+            result = subprocess.run(
+                [uv_path, "pip", "install", "--python", str(python_executable), "--quiet", package],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        else:
+            result = subprocess.run(
+                [str(python_executable), "-m", "pip", "install", "--quiet", package],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        return result.returncode == 0
+    except Exception as e:
+        logger.warning(f"Failed to install {package}: {e}")
+        return False
+
+
 def _install_in_venv(
     venv_dir: Path,
     python_executable: Path,
@@ -251,6 +318,8 @@ def _install_in_venv(
     Install packages in the virtual environment.
     
     Uses `uv pip` if available (much faster), falls back to pip.
+    Automatically substitutes packages that need system dependencies with
+    pure-Python alternatives. If batch install fails, tries one-by-one.
     
     Args:
         venv_dir: Path to the virtual environment directory
@@ -261,52 +330,57 @@ def _install_in_venv(
     Returns:
         Tuple of (success, message)
     """
+    # Substitute problematic packages with alternatives
+    packages = _substitute_problematic_packages(packages)
+    
     # Always install pytest (needed for running tests)
-    all_packages = ["pytest"] + packages
+    all_packages = ["pytest"] + [p for p in packages if p and p != "pytest"]
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_packages = []
+    for p in all_packages:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            unique_packages.append(p)
+    all_packages = unique_packages
+    
+    if not all_packages:
+        return True, "No packages to install"
     
     logger.info(f"Installing packages in venv: {all_packages}")
     
     uv_path = _find_uv_executable()
     
+    # Ensure pip is available for non-uv installs
+    if not uv_path:
+        try:
+            subprocess.run(
+                [str(python_executable), "-m", "ensurepip", "--upgrade"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+        except Exception as e:
+            logger.warning(f"ensurepip failed: {e}")
+    
     try:
+        # Try batch install first (faster)
         if uv_path:
-            # Use uv pip install with --python to target the venv
             result = subprocess.run(
                 [
-                    uv_path,
-                    "pip",
-                    "install",
-                    "--python",
-                    str(python_executable),
-                    "--quiet",
-                    *all_packages,
+                    uv_path, "pip", "install", "--python", str(python_executable),
+                    "--quiet", *all_packages,
                 ],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
             )
         else:
-            # Fallback: bootstrap pip in venv first, then install
-            # First, ensure pip is available
-            bootstrap_result = subprocess.run(
-                [str(python_executable), "-m", "ensurepip", "--upgrade"],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            if bootstrap_result.returncode != 0:
-                logger.warning(f"ensurepip failed: {bootstrap_result.stderr}")
-            
-            # Now install packages
             result = subprocess.run(
                 [
-                    str(python_executable),
-                    "-m",
-                    "pip",
-                    "install",
-                    "--quiet",
-                    "--disable-pip-version-check",
-                    *all_packages,
+                    str(python_executable), "-m", "pip", "install",
+                    "--quiet", "--disable-pip-version-check", *all_packages,
                 ],
                 capture_output=True,
                 text=True,
@@ -316,10 +390,36 @@ def _install_in_venv(
         if result.returncode == 0:
             logger.info(f"Successfully installed in venv: {all_packages}")
             return True, f"Installed: {', '.join(all_packages)}"
-        else:
-            error_msg = result.stderr or result.stdout or "Unknown error"
-            logger.warning(f"Failed to install packages in venv: {error_msg}")
-            return False, f"Installation failed: {error_msg[:300]}"
+        
+        # Batch failed - try installing one by one
+        logger.warning("Batch install failed, trying packages individually...")
+        installed = []
+        failed = []
+        
+        for pkg in all_packages:
+            if _install_single_package(uv_path, python_executable, pkg, timeout=60):
+                installed.append(pkg)
+                logger.info(f"Installed: {pkg}")
+            else:
+                # Try alternative if available
+                pkg_lower = pkg.lower()
+                if pkg_lower in PACKAGES_WITH_SYSTEM_DEPS:
+                    alt = PACKAGES_WITH_SYSTEM_DEPS[pkg_lower]
+                    if alt and _install_single_package(uv_path, python_executable, alt, timeout=60):
+                        installed.append(f"{alt} (alt for {pkg})")
+                        logger.info(f"Installed alternative {alt} for {pkg}")
+                        continue
+                failed.append(pkg)
+                logger.warning(f"Failed to install: {pkg}")
+        
+        if failed:
+            msg = f"Installed: {installed}. Failed: {failed}"
+            # Still return True if pytest was installed (tests can run)
+            if "pytest" in installed:
+                return True, msg
+            return False, msg
+        
+        return True, f"Installed (individually): {', '.join(installed)}"
             
     except subprocess.TimeoutExpired:
         logger.warning(f"Package installation timed out after {timeout}s")
