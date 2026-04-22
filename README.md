@@ -34,7 +34,7 @@ node --version      # Should be v18 or higher
 
 ### 1. Clone the Repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/IE624-cobol-migrator.git
+git clone https://github.com/Akshit-77/IE624-cobol-migrator.git
 cd IE624-cobol-migrator
 ```
 
