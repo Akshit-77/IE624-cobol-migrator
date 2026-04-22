@@ -73,6 +73,23 @@ IMPORT_TO_PACKAGE = {
     "yaml": "PyYAML",
     "bs4": "beautifulsoup4",
     "dateutil": "python-dateutil",
+    "dotenv": "python-dotenv",
+    "jwt": "PyJWT",
+    "psycopg2": "psycopg2-binary",
+    "MySQLdb": "mysqlclient",
+    "serial": "pyserial",
+    "usb": "pyusb",
+    "Crypto": "pycryptodome",
+    "lxml": "lxml",
+    "numpy": "numpy",
+    "pandas": "pandas",
+    "requests": "requests",
+    "flask": "flask",
+    "django": "django",
+    "fastapi": "fastapi",
+    "sqlalchemy": "sqlalchemy",
+    "pytest": "pytest",
+    "hypothesis": "hypothesis",
 }
 
 
@@ -349,12 +366,16 @@ def create_test_environment(
     """
     Create an isolated test environment with its own virtual environment.
     
+    ALWAYS creates a virtual environment for proper isolation and installs
+    all required dependencies. This ensures tests run in a clean environment
+    with all necessary modules available.
+    
     Args:
         python_code: The generated Python code to test
         test_code: The pytest test code
         cobol_source: Original COBOL source (for dummy file generation)
         io_contract: I/O contract from analysis (for dummy file generation)
-        create_dummy_files_flag: Whether to create dummy input files and venv
+        create_dummy_files_flag: Whether to create dummy input files
     
     Returns:
         Tuple of (TestEnvironment, error_message).
@@ -385,35 +406,31 @@ def create_test_environment(
         dummy_files: list[str] = []
         installed_packages: list[str] = []
         venv_dir = temp_dir / "venv"
-        python_executable: Path
         
-        # Create venv and install dependencies if dummy files flag is enabled
-        if create_dummy_files_flag:
-            # Create virtual environment
-            python_executable = _create_venv(venv_dir)
-            
-            # Create dummy files
-            if cobol_source:
-                specs = generate_dummy_file_specs(cobol_source, python_code, io_contract)
-                if specs:
-                    result = create_dummy_files(specs, src_dir)
-                    if result.success:
-                        dummy_files = result.files_created
-                        logger.info(f"Created {len(dummy_files)} dummy files")
-                    else:
-                        logger.warning(f"Failed to create dummy files: {result.error}")
-            
-            # Install dependencies in venv
-            packages = _get_required_packages(python_code, test_code)
-            success, msg = _install_in_venv(venv_dir, python_executable, packages)
-            if success:
-                installed_packages = packages
-            else:
-                logger.warning(f"Package installation warning: {msg}")
+        # ALWAYS create virtual environment for proper isolation
+        python_executable = _create_venv(venv_dir)
+        
+        # Create dummy files if requested
+        if create_dummy_files_flag and cobol_source:
+            specs = generate_dummy_file_specs(cobol_source, python_code, io_contract)
+            if specs:
+                result = create_dummy_files(specs, src_dir)
+                if result.success:
+                    dummy_files = result.files_created
+                    logger.info(f"Created {len(dummy_files)} dummy files")
+                else:
+                    logger.warning(f"Failed to create dummy files: {result.error}")
+        
+        # ALWAYS install pytest and any detected dependencies
+        packages = _get_required_packages(python_code, test_code)
+        success, msg = _install_in_venv(venv_dir, python_executable, packages)
+        if success:
+            installed_packages = ["pytest"] + packages
+            logger.info(f"Installed packages: {installed_packages}")
         else:
-            # No venv - use system Python (for simple tests)
-            python_executable = Path(sys.executable)
-            venv_dir = temp_dir / "venv"  # placeholder, won't be created
+            logger.warning(f"Package installation warning: {msg}")
+            # Still record what we tried to install
+            installed_packages = ["pytest"] + packages
         
         env = TestEnvironment(
             temp_dir=temp_dir,
@@ -442,14 +459,18 @@ def run_tests_in_environment(
     env: TestEnvironment,
     python_code: str,
     timeout: int = 60,
+    max_install_retries: int = 2,
 ) -> TestResult:
     """
     Run tests in the isolated environment using the venv's Python.
+    
+    If tests fail due to missing modules, automatically installs them and retries.
     
     Args:
         env: The test environment to use
         python_code: The Python code (for safety check)
         timeout: Maximum execution time in seconds
+        max_install_retries: Maximum number of times to retry after installing modules
     
     Returns:
         TestResult with execution details
@@ -472,64 +493,103 @@ def run_tests_in_environment(
     start_time = time.perf_counter()
     src_dir = env.main_file.parent
     
-    try:
-        # Get environment with venv activated
-        if env.venv_dir.exists():
-            safe_env = _get_safe_env(env.venv_dir)
-        else:
-            safe_env = os.environ.copy()
-            safe_env["LANG"] = "C.UTF-8"
-            safe_env["LC_ALL"] = "C.UTF-8"
-        
-        # Add src directory to PYTHONPATH
-        existing_pythonpath = safe_env.get("PYTHONPATH", "")
-        if existing_pythonpath:
-            safe_env["PYTHONPATH"] = f"{src_dir}:{existing_pythonpath}"
-        else:
-            safe_env["PYTHONPATH"] = str(src_dir)
-        
-        # Run pytest using the venv's Python
-        result = subprocess.run(
-            [
-                str(env.python_executable),
-                "-m",
-                "pytest",
-                "-v",
-                "--tb=short",
-                "-x",  # Stop on first failure
-                str(env.test_file),
-            ],
-            cwd=str(src_dir),  # Run in src directory where files are
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=safe_env,
-        )
-        
-        passed = result.returncode == 0
-        stdout = truncate_output(result.stdout)
-        stderr = truncate_output(result.stderr)
-        
-        if not passed:
-            issues.extend(_analyze_test_output(stdout, stderr))
-        
-    except subprocess.TimeoutExpired:
-        passed = False
-        stdout = ""
-        stderr = f"TEST TIMEOUT: Execution exceeded {timeout} seconds"
-        issues.append(f"Test execution timed out after {timeout} seconds")
-        
-    except FileNotFoundError as e:
-        passed = False
-        stdout = ""
-        stderr = f"EXECUTION ERROR: {e}"
-        issues.append(f"Missing executable or file: {e}")
-        
-    except Exception as e:
-        passed = False
-        stdout = ""
-        stderr = f"TEST EXECUTION ERROR: {e}"
-        issues.append(f"Unexpected error during test execution: {e}")
+    # Prepare environment variables
+    if env.venv_dir.exists():
+        safe_env = _get_safe_env(env.venv_dir)
+    else:
+        safe_env = os.environ.copy()
+        safe_env["LANG"] = "C.UTF-8"
+        safe_env["LC_ALL"] = "C.UTF-8"
+    
+    # Add src directory to PYTHONPATH
+    existing_pythonpath = safe_env.get("PYTHONPATH", "")
+    if existing_pythonpath:
+        safe_env["PYTHONPATH"] = f"{src_dir}:{existing_pythonpath}"
+    else:
+        safe_env["PYTHONPATH"] = str(src_dir)
+    
+    stdout = ""
+    stderr = ""
+    passed = False
+    installed_on_retry: list[str] = []
+    
+    for attempt in range(max_install_retries + 1):
+        try:
+            # Run pytest using the venv's Python
+            result = subprocess.run(
+                [
+                    str(env.python_executable),
+                    "-m",
+                    "pytest",
+                    "-v",
+                    "--tb=short",
+                    "-x",  # Stop on first failure
+                    str(env.test_file),
+                ],
+                cwd=str(src_dir),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=safe_env,
+            )
+            
+            passed = result.returncode == 0
+            stdout = truncate_output(result.stdout)
+            stderr = truncate_output(result.stderr)
+            
+            if passed:
+                break
+            
+            # Check if failure was due to missing modules
+            missing_modules = _extract_missing_modules(result.stdout, result.stderr)
+            
+            if missing_modules and attempt < max_install_retries and env.venv_dir.exists():
+                logger.info(f"Test failed due to missing modules: {missing_modules}, installing...")
+                success, msg = _install_in_venv(
+                    env.venv_dir,
+                    env.python_executable,
+                    missing_modules,
+                    timeout=120,
+                )
+                if success:
+                    installed_on_retry.extend(missing_modules)
+                    logger.info(f"Installed {missing_modules}, retrying tests...")
+                    continue
+                else:
+                    logger.warning(f"Failed to install {missing_modules}: {msg}")
+                    issues.append(f"Failed to install required modules: {', '.join(missing_modules)}")
+                    break
+            else:
+                # Not a missing module issue, or out of retries
+                break
+                
+        except subprocess.TimeoutExpired:
+            passed = False
+            stdout = ""
+            stderr = f"TEST TIMEOUT: Execution exceeded {timeout} seconds"
+            issues.append(f"Test execution timed out after {timeout} seconds")
+            break
+            
+        except FileNotFoundError as e:
+            passed = False
+            stdout = ""
+            stderr = f"EXECUTION ERROR: {e}"
+            issues.append(f"Missing executable or file: {e}")
+            break
+            
+        except Exception as e:
+            passed = False
+            stdout = ""
+            stderr = f"TEST EXECUTION ERROR: {e}"
+            issues.append(f"Unexpected error during test execution: {e}")
+            break
+    
+    if not passed and not issues:
+        issues.extend(_analyze_test_output(stdout, stderr))
+    
+    if installed_on_retry:
+        env.installed_packages.extend(installed_on_retry)
+        logger.info(f"Additional packages installed on retry: {installed_on_retry}")
     
     duration_ms = int((time.perf_counter() - start_time) * 1000)
     
@@ -543,6 +603,35 @@ def run_tests_in_environment(
     )
 
 
+def _extract_missing_modules(stdout: str, stderr: str) -> list[str]:
+    """
+    Extract names of missing modules from test output.
+    
+    Returns list of module/package names that need to be installed.
+    """
+    combined = f"{stdout}\n{stderr}"
+    missing = []
+    
+    # Pattern: ModuleNotFoundError: No module named 'xxx'
+    for match in re.finditer(r"no module named ['\"]?(\w+)", combined, re.IGNORECASE):
+        module = match.group(1)
+        if module not in STDLIB_MODULES and module not in {"main", "test_main"}:
+            # Map import name to package name if needed
+            package = IMPORT_TO_PACKAGE.get(module, module)
+            if package not in missing:
+                missing.append(package)
+    
+    # Pattern: ImportError: cannot import name 'xxx' from 'yyy'
+    for match in re.finditer(r"cannot import name .+ from ['\"]?(\w+)", combined, re.IGNORECASE):
+        module = match.group(1)
+        if module not in STDLIB_MODULES and module not in {"main", "test_main"}:
+            package = IMPORT_TO_PACKAGE.get(module, module)
+            if package not in missing:
+                missing.append(package)
+    
+    return missing
+
+
 def _analyze_test_output(stdout: str, stderr: str) -> list[str]:
     """
     Analyze test output to identify specific issues.
@@ -554,9 +643,9 @@ def _analyze_test_output(stdout: str, stderr: str) -> list[str]:
         issues.append("Test requires external files that are not available")
     
     if "modulenotfounderror" in combined or "no module named" in combined:
-        match = re.search(r"no module named ['\"]?(\w+)", combined)
-        if match:
-            issues.append(f"Missing Python module: {match.group(1)}")
+        missing = _extract_missing_modules(stdout, stderr)
+        if missing:
+            issues.append(f"Missing Python module(s): {', '.join(missing)}")
         else:
             issues.append("Missing required Python module")
     
