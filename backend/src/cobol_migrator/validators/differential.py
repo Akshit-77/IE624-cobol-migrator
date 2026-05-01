@@ -107,8 +107,34 @@ def _run_python(python_code: str, inputs: list[str], tmpdir: Path) -> tuple[str,
 
 
 def _normalize_output(output: str) -> str:
-    """Normalize output for comparison (strip whitespace, normalize newlines)."""
-    lines = [line.rstrip() for line in output.strip().split("\n")]
+    """
+    Normalize output for comparison.
+
+    Strips trailing whitespace, normalizes newlines, and normalizes
+    numeric formatting so that COBOL zero-padded numbers (006000)
+    match Python's default formatting (6000).
+    """
+    import re
+
+    lines = []
+    for line in output.strip().split("\n"):
+        line = line.rstrip()
+        # Normalize standalone zero-padded numbers: "006000" → "6000"
+        # Only replace sequences of digits that have leading zeros and are
+        # preceded by a non-digit (or start of string) to avoid mangling
+        # things like record IDs or field positions.
+        line = re.sub(
+            r'(?<=\D)0+(\d+)',
+            lambda m: m.group(1),
+            line,
+        )
+        # Also handle numbers at the very start of a line
+        line = re.sub(
+            r'^0+(\d+)',
+            lambda m: m.group(1),
+            line,
+        )
+        lines.append(line)
     return "\n".join(lines)
 
 

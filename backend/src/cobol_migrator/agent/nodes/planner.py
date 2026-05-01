@@ -40,6 +40,8 @@ what action to take next based on the current state of the migration.
 1. If COBOL validated is "No", do VALIDATE_COBOL first (mandatory, one-time step)
 2. If COBOL validated is "Yes" and program_summary is not set, ANALYZE next
 3. If no drafts exist, TRANSLATE next
+4. **CRITICAL: After tests PASS on a new draft, ALWAYS do VALIDATE before FINISH or TRANSLATE** \
+   — never assume the old validation verdict still applies to the new draft
 3. After TRANSLATE, do GEN_TESTS then RUN_TESTS
 4. If tests FAIL, REFLECT to learn from the failure
 5. After REFLECT:
@@ -321,6 +323,34 @@ def planner(state: AgentState) -> dict[str, Any]:
             "plan": f"Finishing due to external dependency: {resource}",
         }
     
+    # If tests passed on the current draft but it hasn't been validated
+    # (or was validated on a different draft), force VALIDATE
+    test_runs = state.get("test_runs", [])
+    current_draft_id = state.get("current_draft_id")
+    validation_scores = state.get("validation_scores", {})
+    validated_draft = validation_scores.get("_validated_draft_id")
+    if (
+        current_draft_id
+        and test_runs
+        and test_runs[-1].draft_id == current_draft_id
+        and test_runs[-1].passed
+        and validated_draft != current_draft_id
+    ):
+        logger.info("Tests passed on current draft but not yet validated, forcing VALIDATE")
+        emit(
+            "planner_decision",
+            {
+                "reasoning": "Tests passed — running validation stack to compare COBOL vs Python output",
+                "next_action": "VALIDATE",
+                "target_draft_id": current_draft_id,
+                "step_count": state.get("step_count", 0),
+            },
+        )
+        return {
+            "next_action": "VALIDATE",
+            "plan": "Tests passed, validate before finishing",
+        }
+
     # Check if we're stuck in a test loop - force translate if so
     should_translate, translate_reason = _should_force_translate(state)
     if should_translate:

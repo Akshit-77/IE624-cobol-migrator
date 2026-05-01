@@ -230,13 +230,39 @@ def reflect(state: AgentState) -> dict[str, Any]:
 
     last_run = test_runs[-1]
 
-    if last_run.passed:
+    validation_scores = state.get("validation_scores", {})
+    validation_verdict = validation_scores.get("verdict")
+
+    if last_run.passed and validation_verdict not in ("broken", "partial"):
         emit(
             "lesson_learned",
             {
                 "lesson": "Tests passed - no reflection needed",
-                "recommended_action": "FINISH",
+                "recommended_action": "VALIDATE" if not validation_verdict else "FINISH",
                 "root_cause": "N/A - tests passed",
+            },
+        )
+        return {"lessons_learned": lessons}
+
+    if last_run.passed and validation_verdict in ("broken", "partial"):
+        diff = validation_scores.get("differential", {})
+        diff_details = diff.get("match_details", "") if isinstance(diff, dict) else ""
+        lesson = (
+            f"Tests pass but differential validation shows output mismatch. "
+            f"Likely a formatting difference (e.g., COBOL zero-pads numbers "
+            f"with PIC 9(n) but Python prints without leading zeros). "
+            f"Fix: use str.zfill() or f-string formatting like f'{{value:0Nd}}' "
+            f"to match COBOL output formatting. Details: {diff_details[:200]}"
+        )
+        if not any(_lessons_similar(lesson, existing) for existing in lessons):
+            lessons.append(lesson)
+
+        emit(
+            "lesson_learned",
+            {
+                "lesson": lesson,
+                "recommended_action": "TRANSLATE",
+                "root_cause": "Output formatting mismatch between COBOL and Python",
             },
         )
         return {"lessons_learned": lessons}

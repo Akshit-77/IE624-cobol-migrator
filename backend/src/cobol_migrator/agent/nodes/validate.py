@@ -147,6 +147,9 @@ def validate(state: AgentState) -> dict[str, Any]:
         },
     )
 
+    result = asdict(scorecard)
+    result["_validated_draft_id"] = current_draft.id
+
     return {
-        "validation_scores": asdict(scorecard),
+        "validation_scores": result,
     }
