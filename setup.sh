@@ -140,6 +140,38 @@ if ! check_command npm; then
 fi
 print_success "npm is installed"
 
+# Check GnuCOBOL (required for COBOL validation and differential testing)
+print_step "Checking GnuCOBOL (COBOL compiler)..."
+if check_command cobc; then
+    print_success "GnuCOBOL is installed ($(cobc --version 2>&1 | head -1))"
+else
+    print_warning "GnuCOBOL (cobc) not found. Installing..."
+    if check_command apt-get; then
+        sudo apt-get update -qq && sudo apt-get install -y gnucobol
+    elif check_command brew; then
+        brew install gnucobol
+    elif check_command dnf; then
+        sudo dnf install -y gnucobol
+    elif check_command pacman; then
+        sudo pacman -S --noconfirm gnucobol
+    else
+        print_error "Could not install GnuCOBOL automatically."
+        echo "  Please install GnuCOBOL manually for your platform."
+        echo "  Ubuntu/Debian: sudo apt install gnucobol"
+        echo "  macOS: brew install gnucobol"
+        echo "  Fedora: sudo dnf install gnucobol"
+        exit 1
+    fi
+
+    if check_command cobc; then
+        print_success "GnuCOBOL installed successfully"
+    else
+        print_error "GnuCOBOL installation failed"
+        echo "  Please install manually: sudo apt install gnucobol"
+        exit 1
+    fi
+fi
+
 # -----------------------------------------------------------------------------
 # Install uv (Python package manager)
 # -----------------------------------------------------------------------------

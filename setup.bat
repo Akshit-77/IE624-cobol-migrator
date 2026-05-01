@@ -135,6 +135,42 @@ if errorlevel 1 (
 )
 
 :: -----------------------------------------------------------------------------
+:: Check / Install GnuCOBOL
+:: -----------------------------------------------------------------------------
+
+echo.
+echo %BLUE%^> Checking GnuCOBOL (COBOL compiler)...%NC%
+
+cobc --version >nul 2>&1
+if errorlevel 1 (
+    echo %YELLOW%  GnuCOBOL (cobc) not found. Attempting to install via Chocolatey...%NC%
+    choco --version >nul 2>&1
+    if errorlevel 1 (
+        echo %RED%X GnuCOBOL is not installed and Chocolatey is not available.%NC%
+        echo   Please install GnuCOBOL manually:
+        echo     Option 1: Install Chocolatey ^(https://chocolatey.org/install^) then run: choco install gnucobol
+        echo     Option 2: Download from https://www.arnoldtrembley.com/GnuCOBOL.htm
+        echo.
+        echo %YELLOW%  Continuing without GnuCOBOL - COBOL validation and differential testing will be skipped.%NC%
+    ) else (
+        choco install gnucobol -y
+        cobc --version >nul 2>&1
+        if errorlevel 1 (
+            echo %YELLOW%  GnuCOBOL installation via Chocolatey did not succeed.%NC%
+            echo %YELLOW%  Continuing without it - COBOL validation will be skipped.%NC%
+        ) else (
+            echo %GREEN%  GnuCOBOL installed successfully via Chocolatey%NC%
+        )
+    )
+) else (
+    for /f "delims=" %%v in ('cobc --version 2^>^&1') do (
+        echo %GREEN%  %%v%NC%
+        goto :cobc_done
+    )
+    :cobc_done
+)
+
+:: -----------------------------------------------------------------------------
 :: Setup Backend
 :: -----------------------------------------------------------------------------
 

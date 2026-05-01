@@ -27,8 +27,8 @@ You are the planning component of a COBOL-to-Python migration agent. Your job is
 what action to take next based on the current state of the migration.
 
 ## Available Actions
-- VALIDATE_COBOL: Compile and validate the input COBOL code (mandatory first step)
-- ANALYZE: Analyze the COBOL source to understand its structure (do after validation)
+- VALIDATE_COBOL: Compile and validate the input COBOL code (mandatory first step, do NOT repeat if already done)
+- ANALYZE: Analyze the COBOL source to understand its structure (do after COBOL is validated)
 - TRANSLATE: Generate a new Python translation of the COBOL code
 - GEN_TESTS: Generate pytest tests for the current Python draft
 - RUN_TESTS: Execute the generated tests against the current draft
@@ -37,8 +37,8 @@ what action to take next based on the current state of the migration.
 - FINISH: Complete the migration (use when tests pass or budget exhausted)
 
 ## Decision Guidelines
-1. If COBOL has NOT been validated yet, do VALIDATE_COBOL first (mandatory first step)
-2. If program_summary is not set, ANALYZE first
+1. If COBOL validated is "No", do VALIDATE_COBOL first (mandatory, one-time step)
+2. If COBOL validated is "Yes" and program_summary is not set, ANALYZE next
 3. If no drafts exist, TRANSLATE next
 3. After TRANSLATE, do GEN_TESTS then RUN_TESTS
 4. If tests FAIL, REFLECT to learn from the failure
@@ -58,6 +58,7 @@ what action to take next based on the current state of the migration.
 
 ### Progress
 Step: {step_count}/{step_budget}
+COBOL validated: {cobol_validated}
 Drafts created: {draft_count}
 Tests run: {test_count}
 
@@ -349,6 +350,7 @@ def planner(state: AgentState) -> dict[str, Any]:
     prompt = PLANNER_SYSTEM_PROMPT.format(
         step_count=state.get("step_count", 0),
         step_budget=state.get("step_budget", 25),
+        cobol_validated="Yes" if state.get("cobol_validated", False) else "No",
         draft_count=len(state.get("python_drafts", [])),
         test_count=len(state.get("test_runs", [])),
         program_context=program_context,
