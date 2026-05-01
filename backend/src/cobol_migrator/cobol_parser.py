@@ -45,9 +45,15 @@ class COBOLField:
                 int_value = int(base_value * (10 ** self.decimal_places))
                 return str(int_value).zfill(self.length)[:self.length]
             else:
-                # Pure integer: left-pad with zeros
-                value = str(index * 1000 + index)
-                return value.zfill(self.length)[:self.length]
+                # Pure integer: generate contextually appropriate values
+                name_upper = self.name.upper()
+                if any(x in name_upper for x in ["SALARY", "PAY", "WAGE", "AMOUNT", "TOTAL", "BONUS"]):
+                    value = 30000 + (index * 5000)
+                elif any(x in name_upper for x in ["ID", "NUM", "NO", "NBR", "CODE"]):
+                    value = 1000 + index
+                else:
+                    value = index * 1000 + index
+                return str(value).zfill(self.length)[:self.length]
         else:
             # Alphanumeric: right-pad with spaces
             # Check if this looks like an ID field
@@ -120,8 +126,8 @@ def parse_pic_clause(pic: str) -> tuple[int, bool, int]:
     is_numeric = False
     decimal_places = 0
     
-    # Check if it's numeric (contains 9 or Z but no X)
-    is_numeric = bool(re.search(r'[9Z]', pic)) and 'X' not in pic
+    # Numeric if it contains 9 or Z but no X or A (alphabetic/alphanumeric)
+    is_numeric = bool(re.search(r'[9Z]', pic)) and not re.search(r'[XA]', pic)
     
     # Handle V (implied decimal point)
     v_match = re.search(r'V(\d+|9+)', pic)
@@ -158,20 +164,21 @@ def parse_pic_clause(pic: str) -> tuple[int, bool, int]:
 def _count_pic_chars(pic_part: str) -> int:
     """Count the number of character positions in a PIC clause part."""
     count = 0
-    
-    # Handle (n) repetition notation: X(06), 9(3), Z(7)
-    repeat_pattern = r'([X9SZ])\((\d+)\)'
+
+    # Handle (n) repetition notation: X(06), 9(3), A(10), Z(7)
+    # S is a sign indicator and does NOT occupy a storage position
+    repeat_pattern = r'([X9AZ])\((\d+)\)'
     for match in re.finditer(repeat_pattern, pic_part, re.IGNORECASE):
         count += int(match.group(2))
-    
+
     # Remove matched patterns and count remaining literal chars
     remaining = re.sub(repeat_pattern, '', pic_part, flags=re.IGNORECASE)
-    
-    # Count individual X, 9, Z, S characters
+
+    # Count individual X, 9, A, Z characters (S does not occupy a position)
     for char in remaining:
-        if char.upper() in 'X9ZS':
+        if char.upper() in 'X9AZ':
             count += 1
-    
+
     return count
 
 
@@ -283,34 +290,61 @@ def get_input_file_layout(cobol_source: str) -> tuple[str | None, COBOLRecordLay
     return None, None
 
 
+def _detect_output_files(cobol_source: str) -> set[str]:
+    """Detect which files are opened for OUTPUT or EXTEND in the PROCEDURE DIVISION."""
+    output_files: set[str] = set()
+    upper = cobol_source.upper()
+
+    # Match OUTPUT/EXTEND followed by one or more file names
+    # Handles: OPEN INPUT F1 OUTPUT F2 F3 EXTEND F4
+    for match in re.finditer(r'(?:OUTPUT|EXTEND)\s+([\w-]+(?:\s+[\w-]+)*?)(?=\s+(?:INPUT|OUTPUT|EXTEND|I-O)\b|\.|\n)', upper):
+        names = match.group(1).split()
+        for name in names:
+            name = name.strip()
+            if name and name not in ("INPUT", "OUTPUT", "EXTEND", "I-O"):
+                output_files.add(name)
+
+    # Simpler fallback: just find OUTPUT followed by a single name
+    for match in re.finditer(r'OUTPUT\s+([\w-]+)', upper):
+        output_files.add(match.group(1))
+
+    return output_files
+
+
 def generate_cobol_sample_data(cobol_source: str, count: int = 3) -> dict[str, str]:
     """
     Generate sample data files based on COBOL source analysis.
-    
+
+    Input files get synthetic data records. Output files are created empty
+    since the program writes to them.
+
     Returns dict mapping filename to file content.
     """
     result = {}
-    
+
     assignments = extract_file_assignments(cobol_source)
     layouts = extract_fd_records(cobol_source)
-    
+    output_logical_names = _detect_output_files(cobol_source)
+
     for fd_name, layout in layouts.items():
-        # Find the physical filename
         physical_name = None
         for logical, physical in assignments.items():
             if fd_name.upper() in logical or logical in fd_name.upper():
                 physical_name = physical
                 break
-        
+
         if not physical_name:
             physical_name = f"{fd_name}.DAT"
-        
-        # Skip output files
-        if any(x in physical_name.lower() for x in ['.rpt', '.out', 'report', 'output']):
-            continue
-        
-        # Generate records
-        records = layout.generate_sample_records(count)
-        result[physical_name] = "\n".join(records) + "\n"
-    
+
+        is_output = (
+            fd_name.upper() in output_logical_names
+            or any(x in physical_name.lower() for x in ['.rpt', '.out', 'report', 'output'])
+        )
+
+        if is_output:
+            result[physical_name] = ""
+        else:
+            records = layout.generate_sample_records(count)
+            result[physical_name] = "\n".join(records) + "\n"
+
     return result
