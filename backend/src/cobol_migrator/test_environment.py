@@ -462,6 +462,7 @@ def create_test_environment(
     cobol_source: str | None = None,
     io_contract: dict | None = None,
     create_dummy_files_flag: bool = False,
+    program_summary: str | None = None,
 ) -> tuple[TestEnvironment | None, str | None]:
     """
     Create an isolated test environment with its own virtual environment.
@@ -514,7 +515,9 @@ def create_test_environment(
         
         # Create dummy files if requested
         if create_dummy_files_flag and cobol_source:
-            specs = generate_dummy_file_specs(cobol_source, python_code, io_contract)
+            specs = generate_dummy_file_specs(
+                cobol_source, python_code, io_contract, program_summary,
+            )
             if specs:
                 result = create_dummy_files(specs, src_dir)
                 if result.success:
@@ -790,6 +793,7 @@ def run_isolated_tests(
     create_dummy_files_flag: bool = False,
     timeout: int = 60,
     cleanup_on_success: bool = True,
+    program_summary: str | None = None,
 ) -> TestResult:
     """
     High-level function to run tests in a complete isolated environment.
@@ -819,6 +823,7 @@ def run_isolated_tests(
         cobol_source=cobol_source,
         io_contract=io_contract,
         create_dummy_files_flag=create_dummy_files_flag,
+        program_summary=program_summary,
     )
     
     if error or env is None:

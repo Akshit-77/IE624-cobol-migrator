@@ -40,6 +40,7 @@ def run_tests(state: AgentState) -> dict[str, Any]:
     should_create_dummy_files = state.get("create_dummy_files", False)
     cobol_source = state.get("cobol_source", "")
     io_contract = state.get("io_contract")
+    program_summary = state.get("program_summary")
 
     # Emit start event
     emit(
@@ -59,6 +60,7 @@ def run_tests(state: AgentState) -> dict[str, Any]:
         create_dummy_files_flag=should_create_dummy_files,
         timeout=60,
         cleanup_on_success=True,
+        program_summary=program_summary if should_create_dummy_files else None,
     )
 
     # Log to run logger if available
