@@ -98,6 +98,9 @@ Outputs: {outputs}
 
 {record_layout_info}
 
+## OUTPUT METHOD ANALYSIS (follow this — do NOT guess)
+{output_method_info}
+
 ## RULES - Follow EXACTLY
 
 1. **Import**: `from main import main` (NEVER use subprocess)
@@ -106,47 +109,40 @@ Outputs: {outputs}
    - CORRECT: `def test_foo(capsys):` then `capsys.readouterr()`
    - WRONG: `import capsys` or `capsys = ...`
 
-3. **Choose test type based on code behavior**:
-   - Code uses `print()` → use `capsys` fixture
-   - Code uses `open()` to write files → check file exists, DON'T use capsys
+3. **Match the OUTPUT METHOD above**:
+   - If output method is "stdout" → use `capsys` fixture, assert `captured.out`
+   - If output method is "file" → check the EXACT output files listed above
+   - If output method is "both" → check both
+   - **NEVER assert that a file exists unless it is listed in "Output files" above**
+   - **NEVER invent output filenames** — if the program prints to stdout, do NOT check for files
 
-4. **For file I/O programs** - the test environment already provides dummy input \
-files with correct format and synthetic data in the working directory. Your tests \
-should use them directly:
+4. **For programs that READ input files** - the test environment already provides \
+dummy input files in the working directory. Copy them into tmp_path:
 ```python
 def test_main_runs(tmp_path, monkeypatch):
-    import shutil
-    # Copy pre-generated dummy files into tmp_path
-    import pathlib
+    import shutil, pathlib
     src_dir = pathlib.Path.cwd()
-    for f in src_dir.glob("*.DAT"):
-        shutil.copy(f, tmp_path / f.name)
+    for f in src_dir.iterdir():
+        if f.suffix.upper() in (".DAT", ".TXT", ".DATA"):
+            shutil.copy(f, tmp_path / f.name)
     monkeypatch.chdir(tmp_path)
     main()
 ```
 
-5. **NEVER assert exact record lengths, exact output sizes, or hardcoded numeric values**. \
-These are the #1 cause of false test failures. Instead:
+5. **NEVER assert exact lengths, exact sizes, or hardcoded values**:
 ```python
-# GOOD - structural checks
+# GOOD
+assert len(captured.out.strip()) > 0
 assert output_file.exists()
-assert len(output_content.strip()) > 0  # has content
-assert output_content.count("\\n") >= 1  # has records
 
-# BAD - brittle, NEVER do this
-assert len(line) == 19  # WRONG: you don't know the exact output format
-assert line == "exact string"  # WRONG: too brittle
-assert "35000" in content  # WRONG: depends on input data
+# BAD - NEVER do this
+assert len(line) == 19
+assert "35000" in content
 ```
-
-6. **If the program writes output files**, check:
-   - The output file was created
-   - It has at least one line of content
-   - Do NOT check exact lengths, exact values, or exact record counts
 
 ## Generate exactly 2 tests:
 1. `test_main_runs_without_error` - call main(), verify no exceptions
-2. `test_produces_output` - verify output exists (file or stdout)
+2. `test_produces_output` - verify output exists using the CORRECT method (stdout or file)
 
 Keep tests SIMPLE. Two passing tests are better than three where one is brittle.
 """
@@ -203,6 +199,36 @@ def test_produces_output(tmp_path, monkeypatch):
 '''
 
 
+FALLBACK_FILE_IO_STDOUT_TEMPLATE = '''\
+"""Auto-generated tests for COBOL migration (reads files, prints to stdout)."""
+import shutil
+import pathlib
+from main import main
+
+
+def test_main_runs_with_files(tmp_path, monkeypatch):
+    """Test that main runs when input files exist."""
+    src_dir = pathlib.Path.cwd()
+    for f in src_dir.iterdir():
+        if f.suffix.upper() in (".DAT", ".TXT", ".DATA", ".INP", ".IN"):
+            shutil.copy(f, tmp_path / f.name)
+    monkeypatch.chdir(tmp_path)
+    main()
+
+
+def test_produces_output(tmp_path, monkeypatch, capsys):
+    """Test that main produces printed output."""
+    src_dir = pathlib.Path.cwd()
+    for f in src_dir.iterdir():
+        if f.suffix.upper() in (".DAT", ".TXT", ".DATA", ".INP", ".IN"):
+            shutil.copy(f, tmp_path / f.name)
+    monkeypatch.chdir(tmp_path)
+    main()
+    captured = capsys.readouterr()
+    assert len(captured.out.strip()) > 0, "Expected printed output"
+'''
+
+
 def _code_uses_file_io(python_code: str) -> bool:
     """Detect if the Python code does file I/O operations."""
     file_indicators = [
@@ -215,6 +241,38 @@ def _code_uses_file_io(python_code: str) -> bool:
     ]
     code_lower = python_code.lower()
     return any(indicator.lower() in code_lower for indicator in file_indicators)
+
+
+def _detect_output_method(python_code: str) -> str:
+    """
+    Detect how the program produces output: 'stdout', 'file', or 'both'.
+
+    Looks at what the code actually does — print() means stdout,
+    open(..., 'w') means file output.
+    """
+    has_print = "print(" in python_code
+    # Detect file writes: open('...', 'w'), open('...', 'a'), .write(
+    has_file_write = bool(
+        re.search(r"open\s*\([^)]*['\"][wa]['\"]", python_code)
+        or ".write(" in python_code
+        or "write_text(" in python_code
+    )
+    if has_print and has_file_write:
+        return "both"
+    if has_file_write:
+        return "file"
+    return "stdout"
+
+
+def _detect_output_files(python_code: str) -> list[str]:
+    """Extract filenames the Python code opens for writing."""
+    files = []
+    # Match open('file', 'w') or open('file', 'a') within a single call
+    for match in re.finditer(r"open\s*\(\s*['\"]([^'\"]+)['\"],\s*['\"]([^'\"]*)['\"]", python_code):
+        mode = match.group(2)
+        if "w" in mode or "a" in mode:
+            files.append(match.group(1))
+    return files
 
 
 def _build_lessons_context(state: AgentState) -> str:
@@ -295,8 +353,17 @@ def gen_tests(state: AgentState) -> dict[str, Any]:
     lessons_context = _build_lessons_context(state)
     record_layout_info = _build_record_layout_context(state)
 
+    output_method = _detect_output_method(python_code)
     is_file_io = _code_uses_file_io(python_code)
-    fallback_tests = FALLBACK_FILE_IO_TEST_TEMPLATE if is_file_io else FALLBACK_TEST_TEMPLATE
+    # Fallback: use file I/O template only if the program WRITES output files
+    # If it only reads files but prints to stdout, use the stdout template
+    if output_method in ("file", "both"):
+        fallback_tests = FALLBACK_FILE_IO_TEST_TEMPLATE
+    elif is_file_io:
+        # Reads files but outputs to stdout — needs file setup + capsys
+        fallback_tests = FALLBACK_FILE_IO_STDOUT_TEMPLATE
+    else:
+        fallback_tests = FALLBACK_TEST_TEMPLATE
     tests = fallback_tests
 
     if io_contract:
@@ -307,6 +374,30 @@ def gen_tests(state: AgentState) -> dict[str, Any]:
             f"{p['name']}: {p['type']}" for p in io_contract.get("outputs", [])
         ) or "stdout"
 
+        # Detect how the program actually outputs results
+        output_method = _detect_output_method(python_code)
+        output_files = _detect_output_files(python_code)
+        if output_method == "stdout":
+            output_method_info = (
+                "Output method: **STDOUT (print)**\n"
+                "The program uses print() to display results. Use `capsys` fixture.\n"
+                "Do NOT check for any output files — the program does not create them."
+            )
+        elif output_method == "file":
+            files_list = ", ".join(output_files) if output_files else "unknown"
+            output_method_info = (
+                f"Output method: **FILE**\n"
+                f"Output files: {files_list}\n"
+                f"Check ONLY these files. Do NOT invent other filenames."
+            )
+        else:
+            files_list = ", ".join(output_files) if output_files else "unknown"
+            output_method_info = (
+                f"Output method: **BOTH (stdout + file)**\n"
+                f"Output files: {files_list}\n"
+                f"The program prints AND writes files. Check either."
+            )
+
         prompt = GEN_TESTS_SYSTEM_PROMPT.format(
             program_summary=program_summary,
             inputs=inputs_str,
@@ -314,6 +405,7 @@ def gen_tests(state: AgentState) -> dict[str, Any]:
             python_code=python_code[:6000],
             lessons_context=lessons_context,
             record_layout_info=record_layout_info,
+            output_method_info=output_method_info,
         )
 
         try:
