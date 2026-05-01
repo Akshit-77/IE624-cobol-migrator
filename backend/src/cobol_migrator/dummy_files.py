@@ -89,6 +89,43 @@ def _build_layout_description(layout: COBOLRecordLayout) -> str:
     return "\n".join(lines)
 
 
+def _validate_and_repair_record(record: str, layout: COBOLRecordLayout) -> str:
+    """
+    Validate a record against the layout and repair field alignment if needed.
+
+    The LLM often gets field widths slightly wrong (e.g., "Bob Johnson" = 11 chars
+    in a 10-char field). This function extracts what the LLM intended for each
+    field position and forces correct padding/truncation.
+    """
+    if len(record) == layout.total_length:
+        # Quick check: try parsing each numeric field
+        all_valid = True
+        for field in layout.fields:
+            chunk = record[field.offset:field.offset + field.length]
+            if field.is_numeric:
+                if not chunk.strip().isdigit():
+                    all_valid = False
+                    break
+        if all_valid:
+            return record
+
+    # Rebuild record field-by-field from whatever the LLM gave us
+    parts = []
+    for field in layout.fields:
+        # Try to extract the intended value from the approximate position
+        raw = record[field.offset:field.offset + field.length] if field.offset < len(record) else ""
+
+        if field.is_numeric:
+            digits = "".join(c for c in raw if c.isdigit())
+            if not digits:
+                digits = "0"
+            parts.append(digits.zfill(field.length)[:field.length])
+        else:
+            parts.append(raw.ljust(field.length)[:field.length])
+
+    return "".join(parts)
+
+
 def _generate_data_via_llm(
     cobol_source: str,
     layout: COBOLRecordLayout,
@@ -102,10 +139,20 @@ def _generate_data_via_llm(
 
     The LLM sees the full COBOL source and record layout so it can
     produce data that makes sense for this specific program.
+
+    After generation, each record is validated and repaired against the
+    layout to guarantee correct field alignment.
     """
     try:
         from pydantic import BaseModel, Field
         from cobol_migrator.models import get_structured_model
+
+        # Build a concrete example from the layout so the LLM can copy the pattern
+        example_record = layout.generate_sample_record(1)
+        field_examples = []
+        for f in layout.fields:
+            val = example_record[f.offset:f.offset + f.length]
+            field_examples.append(f'    {f.name}: "{val}" ({f.length} chars)')
 
         class SyntheticData(BaseModel):
             records: list[str] = Field(
@@ -128,26 +175,28 @@ Generate {record_count} synthetic data records for the file "{filename}" used by
 ## Record Layout
 {layout_desc}
 
+## CONCRETE EXAMPLE (copy this pattern exactly)
+"{example_record}" (total {layout.total_length} chars)
+Field breakdown:
+{chr(10).join(field_examples)}
+
 ## Program Context
 {f"Summary: {program_summary}" if program_summary else "No summary available."}
 
 ## CRITICAL RULES
 1. Each record must be EXACTLY {layout.total_length} characters — no more, no less.
 2. Fields are concatenated directly with NO spaces, commas, or separators between them.
-3. Numeric fields (PIC 9) must be zero-padded on the left (e.g., "00042" for value 42 in a 5-char field).
-4. Alphabetic/alphanumeric fields (PIC A or X) must be space-padded on the right.
-5. For implied decimals (PIC 9(3)V99), store as integer representation: 150.75 becomes "15075".
+3. Numeric fields (PIC 9): zero-pad on LEFT to exact width. "42" in 5-char field → "00042".
+4. Alpha fields (PIC A or X): pad with spaces on RIGHT to exact width. "Jo" in 10-char field → "Jo        ".
+5. EVERY field must be EXACTLY its specified width — truncate if too long, pad if too short.
+6. For implied decimals (PIC 9(3)V99), store as integer: 150.75 → "15075".
 
-## DATA QUALITY REQUIREMENTS
-- Generate data that EXERCISES THE PROGRAM'S LOGIC — not random garbage.
-- Include realistic values appropriate to the domain (e.g., real salary ranges for payroll,
-  real product codes for inventory, real dates for date processing).
-- Include at least one edge case (e.g., zero value, maximum value, boundary condition).
-- Values should be varied enough to test different code paths.
-- If the program calculates something (tax, bonus, totals), provide input that produces
-  non-trivial results.
+## DATA QUALITY
+- Use realistic domain values (real salary ranges, real names that fit the field width, etc.)
+- Include edge cases (zero value, boundary conditions)
+- Vary values across records to exercise different code paths
 
-Return exactly {record_count} records, each as a single string of exactly {layout.total_length} characters.
+Return exactly {record_count} records. Each must be a single string of exactly {layout.total_length} characters.
 """
 
         model = get_structured_model("analyze", SyntheticData)
@@ -155,12 +204,9 @@ Return exactly {record_count} records, each as a single string of exactly {layou
 
         valid_records = []
         for record in result.records:
-            if len(record) == layout.total_length:
-                valid_records.append(record)
-            elif len(record) > layout.total_length:
-                valid_records.append(record[:layout.total_length])
-            else:
-                valid_records.append(record.ljust(layout.total_length))
+            repaired = _validate_and_repair_record(record, layout)
+            if len(repaired) == layout.total_length:
+                valid_records.append(repaired)
 
         if valid_records:
             logger.info(
