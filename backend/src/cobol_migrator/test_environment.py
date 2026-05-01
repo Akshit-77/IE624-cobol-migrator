@@ -483,8 +483,10 @@ def create_test_environment(
     """
     temp_dir = None
     try:
-        # Create temporary directory
-        temp_dir = Path(tempfile.mkdtemp(prefix="cobol_migrator_test_"))
+        # Create test environment under project test_runs/ directory for organized logging
+        project_test_runs = Path(__file__).resolve().parent.parent.parent / "test_runs"
+        project_test_runs.mkdir(parents=True, exist_ok=True)
+        temp_dir = Path(tempfile.mkdtemp(prefix="run_", dir=project_test_runs))
         logger.info(f"Created test environment: {temp_dir}")
         
         # Create src directory for code files

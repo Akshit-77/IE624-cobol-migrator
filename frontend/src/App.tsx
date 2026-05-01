@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   QueryClient,
   QueryClientProvider,
@@ -24,12 +24,17 @@ import {
   Zap,
   FileText,
   Ban,
+  Upload,
+  Download,
+  Shield,
 } from "lucide-react";
 import Editor from "@monaco-editor/react";
 import {
   fetchHealth,
   startMigration,
   stopMigration,
+  uploadAndMigrate,
+  getDownloadUrl,
   subscribeEvents,
   type AgentEvent,
   type MigrationRequest,
@@ -53,10 +58,10 @@ const SAMPLE_COBOL_COMPLEX = `       IDENTIFICATION DIVISION.
        01 WS-TAX       PIC 9(5)V99.
        01 WS-NET-PAY   PIC 9(5)V99.
        PROCEDURE DIVISION.
-           MULTIPLY WS-HOURS BY WS-RATE 
+           MULTIPLY WS-HOURS BY WS-RATE
                GIVING WS-GROSS-PAY.
            COMPUTE WS-TAX = WS-GROSS-PAY * 0.20.
-           SUBTRACT WS-TAX FROM WS-GROSS-PAY 
+           SUBTRACT WS-TAX FROM WS-GROSS-PAY
                GIVING WS-NET-PAY.
            DISPLAY "GROSS PAY: " WS-GROSS-PAY.
            DISPLAY "TAX: " WS-TAX.
@@ -90,6 +95,16 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
           borderColor: "border-cyan-500/50",
           iconBg: "bg-cyan-500/20",
           textColor: "text-cyan-400",
+        };
+      case "cobol_validation":
+        return {
+          icon: Shield,
+          label: event.payload.passed ? "COBOL Valid" : "COBOL Invalid",
+          color: event.payload.passed ? "emerald" : "red",
+          bgGlow: event.payload.passed ? "shadow-emerald-500/20" : "shadow-red-500/20",
+          borderColor: event.payload.passed ? "border-emerald-500/50" : "border-red-500/50",
+          iconBg: event.payload.passed ? "bg-emerald-500/20" : "bg-red-500/20",
+          textColor: event.payload.passed ? "text-emerald-400" : "text-red-400",
         };
       case "analysis_ready":
         return {
@@ -223,6 +238,40 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
           </div>
         );
 
+      case "cobol_validation":
+        return (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <span
+                className={`px-2 py-1 rounded text-xs font-bold ${event.payload.passed ? "bg-emerald-500/20 text-emerald-400" : "bg-red-500/20 text-red-400"}`}
+              >
+                {event.payload.passed ? "VALID" : "INVALID"}
+              </span>
+            </div>
+            <p className="text-sm text-gray-300">{event.payload.message}</p>
+            {event.payload.cobol_output && (
+              <div>
+                <span className="text-xs font-mono uppercase tracking-wider text-gray-500">
+                  COBOL Output
+                </span>
+                <pre className="mt-1 p-2 bg-black/50 rounded text-xs text-emerald-300 font-mono overflow-x-auto max-h-32 overflow-y-auto">
+                  {event.payload.cobol_output}
+                </pre>
+              </div>
+            )}
+            {event.payload.compiler_output && (
+              <div>
+                <span className="text-xs font-mono uppercase tracking-wider text-red-400">
+                  Compiler Errors
+                </span>
+                <pre className="mt-1 p-2 bg-red-950/30 rounded text-xs text-red-300 font-mono overflow-x-auto max-h-32 overflow-y-auto">
+                  {event.payload.compiler_output}
+                </pre>
+              </div>
+            )}
+          </div>
+        );
+
       case "analysis_ready":
         return (
           <div className="space-y-3">
@@ -242,7 +291,7 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
                 <div className="grid grid-cols-2 gap-2 text-xs">
                   <div className="bg-black/30 rounded p-2">
                     <div className="text-violet-400 mb-1">Inputs</div>
-                    {event.payload.io_contract.inputs.map((inp, i) => (
+                    {event.payload.io_contract.inputs.map((inp: { name: string; type: string }, i: number) => (
                       <div key={i} className="text-gray-400">
                         {inp.name}: {inp.type}
                       </div>
@@ -253,7 +302,7 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
                   </div>
                   <div className="bg-black/30 rounded p-2">
                     <div className="text-violet-400 mb-1">Outputs</div>
-                    {event.payload.io_contract.outputs.map((out, i) => (
+                    {event.payload.io_contract.outputs.map((out: { name: string; type: string }, i: number) => (
                       <div key={i} className="text-gray-400">
                         {out.name}: {out.type}
                       </div>
@@ -401,22 +450,21 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
                 </div>
               </div>
               <div>
-                <span className="text-gray-500">Final Status</span>
-                <div
-                  className={`font-mono text-lg ${event.payload?.final_test_passed ? "text-green-400" : "text-amber-400"}`}
-                >
-                  {event.payload?.final_test_passed ? "Success" : "Partial"}
-                </div>
-              </div>
-              <div>
                 <span className="text-gray-500">Verdict</span>
                 <div className="text-cyan-400 font-mono text-lg capitalize">
                   {event.payload?.verdict ?? "—"}
                 </div>
               </div>
+              <div>
+                <span className="text-gray-500">Confidence</span>
+                <div className="text-cyan-400 font-mono text-lg">
+                  {event.payload?.confidence != null
+                    ? `${(event.payload.confidence * 100).toFixed(1)}%`
+                    : "—"}
+                </div>
+              </div>
             </div>
-            
-            {/* Display issues if any */}
+
             {event.payload?.issues && event.payload.issues.length > 0 && (
               <div className="mt-3 p-3 bg-amber-950/30 border border-amber-800/50 rounded-lg">
                 <div className="flex items-center gap-2 mb-2">
@@ -426,9 +474,9 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
                   </span>
                 </div>
                 <ul className="space-y-1">
-                  {event.payload.issues.map((issue, i) => (
+                  {event.payload.issues.map((issue: string, i: number) => (
                     <li key={i} className="text-sm text-amber-200 flex items-start gap-2">
-                      <span className="text-amber-500 mt-0.5">•</span>
+                      <span className="text-amber-500 mt-0.5">&bull;</span>
                       <span>{issue}</span>
                     </li>
                   ))}
@@ -436,18 +484,16 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
               </div>
             )}
 
-            {/* Display external dependency info */}
             {event.payload?.external_dependency && (
               <div className="text-xs text-gray-500">
                 External resource: {event.payload.external_resource}
               </div>
             )}
 
-            {/* Display dummy files info */}
             {event.payload?.used_dummy_files && (
               <div className="text-xs text-blue-400 flex items-center gap-1">
                 <FileText className="w-3 h-3" />
-                Tests used auto-generated mock files
+                Tests used auto-generated mock files with synthetic data
               </div>
             )}
           </div>
@@ -494,7 +540,7 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
 
       <div
         className={`
-          relative bg-gray-900/80 backdrop-blur-sm rounded-xl border 
+          relative bg-gray-900/80 backdrop-blur-sm rounded-xl border
           ${config.borderColor} ${isLatest ? `shadow-lg ${config.bgGlow}` : ""}
           transition-all duration-300 hover:bg-gray-900/90
         `}
@@ -504,12 +550,10 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
           onClick={() => setIsExpanded(!isExpanded)}
           className="w-full flex items-center gap-3 p-4 text-left"
         >
-          {/* Icon */}
           <div className={`p-2 rounded-lg ${config.iconBg}`}>
             <Icon className={`w-5 h-5 ${config.textColor}`} />
           </div>
 
-          {/* Label */}
           <div className="flex-1">
             <div className={`font-medium ${config.textColor}`}>
               {config.label}
@@ -519,7 +563,6 @@ function EventCard({ event, index, isLatest }: EventCardProps) {
             </div>
           </div>
 
-          {/* Expand icon */}
           <motion.div
             animate={{ rotate: isExpanded ? 180 : 0 }}
             transition={{ duration: 0.2 }}
@@ -601,10 +644,9 @@ function StatusBadge({
 }
 
 function MigratorApp() {
-  const [sourceType, setSourceType] = useState<"snippet" | "url" | "repo">(
-    "snippet"
-  );
+  const [sourceType, setSourceType] = useState<"snippet" | "file">("snippet");
   const [sourceRef, setSourceRef] = useState(SAMPLE_COBOL);
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [createDummyFiles, setCreateDummyFiles] = useState(false);
   const [events, setEvents] = useState<AgentEvent[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -612,11 +654,24 @@ function MigratorApp() {
   const [runId, setRunId] = useState<string | null>(null);
   const [finalCode, setFinalCode] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const { data: health, isLoading: healthLoading } = useQuery({
     queryKey: ["health"],
     queryFn: fetchHealth,
     refetchInterval: 30000,
   });
+
+  const handleFileSelect = (file: File) => {
+    setUploadedFile(file);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const text = e.target?.result;
+      if (typeof text === "string") {
+        setSourceRef(text);
+      }
+    };
+    reader.readAsText(file);
+  };
 
   const handleStartMigration = async () => {
     setEvents([]);
@@ -625,14 +680,20 @@ function MigratorApp() {
     setIsStopping(false);
 
     try {
-      const request: MigrationRequest = {
-        source_type: sourceType,
-        source_ref: sourceRef,
-        step_budget: 25,
-        create_dummy_files: createDummyFiles,
-      };
+      let response;
 
-      const response = await startMigration(request);
+      if (sourceType === "file" && uploadedFile) {
+        response = await uploadAndMigrate(uploadedFile, 25, createDummyFiles);
+      } else {
+        const request: MigrationRequest = {
+          source_type: "snippet",
+          source_ref: sourceRef,
+          step_budget: 25,
+          create_dummy_files: createDummyFiles,
+        };
+        response = await startMigration(request);
+      }
+
       setRunId(response.run_id);
 
       const cleanup = subscribeEvents(response.run_id, (event) => {
@@ -676,6 +737,12 @@ function MigratorApp() {
     }
   };
 
+  const handleDownloadCode = () => {
+    if (runId) {
+      window.open(getDownloadUrl(runId), "_blank");
+    }
+  };
+
   useEffect(() => {
     return () => {
       setIsStreaming(false);
@@ -690,6 +757,8 @@ function MigratorApp() {
   const doneEvent = events.find((e) => e.type === "done");
   const isDone = doneEvent !== undefined;
 
+  const confidence = doneEvent?.type === "done" ? doneEvent.payload?.confidence : null;
+
   const getStatus = (): "idle" | "running" | "success" | "error" | "partial" | "cancelled" => {
     if (isStreaming) return "running";
     if (wasCancelled) return "cancelled";
@@ -698,6 +767,11 @@ function MigratorApp() {
     if (isDone) return "partial";
     return "idle";
   };
+
+  const canStart =
+    !isStreaming &&
+    health?.status === "ok" &&
+    (sourceType === "snippet" ? sourceRef.trim().length > 0 : uploadedFile !== null);
 
   return (
     <div className="min-h-screen bg-[#0a0a0f] text-gray-100">
@@ -717,7 +791,7 @@ function MigratorApp() {
               </div>
               <div>
                 <h1 className="text-xl font-bold bg-gradient-to-r from-cyan-400 to-violet-400 bg-clip-text text-transparent">
-                  COBOL → Python Migrator
+                  COBOL &rarr; Python Migrator
                 </h1>
                 <p className="text-xs text-gray-500 font-mono">
                   Agentic AI-powered legacy code transformation
@@ -727,8 +801,7 @@ function MigratorApp() {
 
             <div className="flex items-center gap-4">
               <StatusBadge status={getStatus()} />
-              
-              {/* Connection indicator */}
+
               <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-gray-800/50 border border-gray-700/50">
                 {healthLoading ? (
                   <span className="text-gray-500 text-sm">Checking...</span>
@@ -769,41 +842,53 @@ function MigratorApp() {
 
               {/* Source type selector */}
               <div className="flex gap-2 mb-4 flex-shrink-0">
-                {(["snippet", "url", "repo"] as const).map((type) => (
+                {(["snippet", "file"] as const).map((type) => (
                   <button
                     key={type}
                     onClick={() => setSourceType(type)}
                     disabled={isStreaming}
                     className={`
-                      flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-all
-                      ${sourceType === type 
-                        ? "bg-cyan-500/20 text-cyan-400 border border-cyan-500/50" 
+                      flex-1 px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2
+                      ${sourceType === type
+                        ? "bg-cyan-500/20 text-cyan-400 border border-cyan-500/50"
                         : "bg-gray-800/50 text-gray-400 border border-gray-700/50 hover:bg-gray-800"}
                       disabled:opacity-50 disabled:cursor-not-allowed
                     `}
                   >
-                    {type === "snippet" ? "Paste" : type === "url" ? "URL" : "Repo"}
+                    {type === "snippet" ? (
+                      <>
+                        <Code2 className="w-4 h-4" />
+                        Paste Code
+                      </>
+                    ) : (
+                      <>
+                        <Upload className="w-4 h-4" />
+                        Upload File
+                      </>
+                    )}
                   </button>
                 ))}
               </div>
 
-              {/* Quick samples */}
-              <div className="flex gap-2 mb-4 flex-shrink-0">
-                <button
-                  onClick={() => setSourceRef(SAMPLE_COBOL)}
-                  disabled={isStreaming}
-                  className="text-xs px-2 py-1 rounded bg-gray-800/50 text-gray-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
-                >
-                  Hello World
-                </button>
-                <button
-                  onClick={() => setSourceRef(SAMPLE_COBOL_COMPLEX)}
-                  disabled={isStreaming}
-                  className="text-xs px-2 py-1 rounded bg-gray-800/50 text-gray-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
-                >
-                  Payroll Calc
-                </button>
-              </div>
+              {/* Quick samples (only for snippet mode) */}
+              {sourceType === "snippet" && (
+                <div className="flex gap-2 mb-4 flex-shrink-0">
+                  <button
+                    onClick={() => setSourceRef(SAMPLE_COBOL)}
+                    disabled={isStreaming}
+                    className="text-xs px-2 py-1 rounded bg-gray-800/50 text-gray-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
+                  >
+                    Hello World
+                  </button>
+                  <button
+                    onClick={() => setSourceRef(SAMPLE_COBOL_COMPLEX)}
+                    disabled={isStreaming}
+                    className="text-xs px-2 py-1 rounded bg-gray-800/50 text-gray-400 hover:text-cyan-400 transition-colors disabled:opacity-50"
+                  >
+                    Payroll Calc
+                  </button>
+                </div>
+              )}
 
               {/* Input area */}
               <div className="flex-1 min-h-0 mb-4">
@@ -827,18 +912,80 @@ function MigratorApp() {
                     />
                   </div>
                 ) : (
-                  <input
-                    type="text"
-                    value={sourceRef}
-                    onChange={(e) => setSourceRef(e.target.value)}
-                    className="w-full px-4 py-3 bg-gray-800/50 border border-gray-700/50 rounded-xl text-gray-200 placeholder-gray-500 focus:outline-none focus:border-cyan-500/50 font-mono"
-                    placeholder={
-                      sourceType === "url"
-                        ? "https://example.com/program.cbl"
-                        : "https://github.com/user/repo"
-                    }
-                    disabled={isStreaming}
-                  />
+                  <div className="h-full flex flex-col gap-4">
+                    {/* File upload area */}
+                    <div
+                      onClick={() => !isStreaming && fileInputRef.current?.click()}
+                      onDragOver={(e) => { e.preventDefault(); e.stopPropagation(); }}
+                      onDrop={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        const droppedFile = e.dataTransfer.files[0] as File | undefined;
+                        if (!isStreaming && droppedFile) {
+                          handleFileSelect(droppedFile);
+                        }
+                      }}
+                      className={`
+                        flex flex-col items-center justify-center p-8 rounded-xl border-2 border-dashed
+                        transition-all cursor-pointer
+                        ${uploadedFile
+                          ? "border-cyan-500/50 bg-cyan-950/10"
+                          : "border-gray-700/50 bg-gray-800/20 hover:border-gray-600/50 hover:bg-gray-800/30"}
+                        ${isStreaming ? "opacity-50 cursor-not-allowed" : ""}
+                      `}
+                    >
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept=".cbl,.cob,.cobol,.cpy,.txt"
+                        className="hidden"
+                        disabled={isStreaming}
+                        onChange={(e) => {
+                          const selected = e.target.files?.[0] as File | undefined;
+                          if (selected) {
+                            handleFileSelect(selected);
+                          }
+                        }}
+                      />
+                      <Upload className={`w-10 h-10 mb-3 ${uploadedFile ? "text-cyan-400" : "text-gray-500"}`} />
+                      {uploadedFile ? (
+                        <>
+                          <p className="text-cyan-400 font-medium">{uploadedFile.name}</p>
+                          <p className="text-xs text-gray-500 mt-1">
+                            {(uploadedFile.size / 1024).toFixed(1)} KB
+                          </p>
+                        </>
+                      ) : (
+                        <>
+                          <p className="text-gray-400 font-medium">Drop a COBOL file here</p>
+                          <p className="text-xs text-gray-500 mt-1">
+                            or click to browse (.cbl, .cob, .cobol, .txt)
+                          </p>
+                        </>
+                      )}
+                    </div>
+
+                    {/* Preview of uploaded file */}
+                    {uploadedFile && sourceRef && (
+                      <div className="flex-1 min-h-0 rounded-xl overflow-hidden border border-gray-700/50">
+                        <Editor
+                          height="100%"
+                          defaultLanguage="cobol"
+                          value={sourceRef}
+                          theme="vs-dark"
+                          options={{
+                            minimap: { enabled: false },
+                            fontSize: 13,
+                            fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+                            lineNumbers: "on",
+                            scrollBeyondLastLine: false,
+                            padding: { top: 12, bottom: 12 },
+                            readOnly: true,
+                          }}
+                        />
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
 
@@ -854,10 +1001,10 @@ function MigratorApp() {
                   />
                   <div>
                     <span className="font-medium text-gray-300 text-sm">
-                      Create mock files for testing
+                      Create mock files with synthetic data
                     </span>
                     <p className="text-xs text-gray-500 mt-0.5">
-                      Generate temporary input files for file-dependent programs
+                      Generate temporary input files with synthetic data for file-dependent programs
                     </p>
                   </div>
                 </label>
@@ -865,17 +1012,16 @@ function MigratorApp() {
 
               {/* Action buttons */}
               <div className="flex gap-3">
-                {/* Start button */}
                 <motion.button
                   onClick={handleStartMigration}
-                  disabled={isStreaming || health?.status !== "ok" || !sourceRef}
+                  disabled={!canStart}
                   whileHover={{ scale: 1.02 }}
                   whileTap={{ scale: 0.98 }}
                   className={`
                     flex-1 py-4 rounded-xl font-semibold text-lg transition-all
                     flex items-center justify-center gap-3
-                    ${isStreaming 
-                      ? "bg-gray-800 text-gray-400 cursor-not-allowed" 
+                    ${isStreaming
+                      ? "bg-gray-800 text-gray-400 cursor-not-allowed"
                       : "bg-gradient-to-r from-cyan-500 to-violet-500 text-white hover:shadow-lg hover:shadow-cyan-500/25"}
                     disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-none
                   `}
@@ -898,7 +1044,6 @@ function MigratorApp() {
                   )}
                 </motion.button>
 
-                {/* Stop button - only visible when running */}
                 <AnimatePresence>
                   {isStreaming && (
                     <motion.button
@@ -945,7 +1090,6 @@ function MigratorApp() {
                 </span>
               </div>
 
-              {/* Events timeline */}
               <div className="flex-1 overflow-y-auto min-h-0 pr-2 space-y-3 scrollbar-thin">
                 {events.length === 0 ? (
                   <div className="h-full flex flex-col items-center justify-center text-gray-600">
@@ -978,24 +1122,39 @@ function MigratorApp() {
                   Generated Python
                 </h2>
                 {finalCode && (
-                  <motion.button
-                    onClick={handleCopyCode}
-                    whileHover={{ scale: 1.05 }}
-                    whileTap={{ scale: 0.95 }}
-                    className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gray-800/50 text-gray-400 hover:text-emerald-400 transition-colors"
-                  >
-                    {copied ? (
-                      <>
-                        <Check className="w-4 h-4" />
-                        <span className="text-xs">Copied!</span>
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-4 h-4" />
-                        <span className="text-xs">Copy</span>
-                      </>
+                  <div className="flex items-center gap-2">
+                    {/* Download button */}
+                    {isDone && runId && (
+                      <motion.button
+                        onClick={handleDownloadCode}
+                        whileHover={{ scale: 1.05 }}
+                        whileTap={{ scale: 0.95 }}
+                        className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-900/30 text-emerald-400 hover:bg-emerald-900/50 transition-colors border border-emerald-700/30"
+                      >
+                        <Download className="w-4 h-4" />
+                        <span className="text-xs">.py</span>
+                      </motion.button>
                     )}
-                  </motion.button>
+                    {/* Copy button */}
+                    <motion.button
+                      onClick={handleCopyCode}
+                      whileHover={{ scale: 1.05 }}
+                      whileTap={{ scale: 0.95 }}
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-gray-800/50 text-gray-400 hover:text-emerald-400 transition-colors"
+                    >
+                      {copied ? (
+                        <>
+                          <Check className="w-4 h-4" />
+                          <span className="text-xs">Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-4 h-4" />
+                          <span className="text-xs">Copy</span>
+                        </>
+                      )}
+                    </motion.button>
+                  </div>
                 )}
               </div>
 
@@ -1009,10 +1168,10 @@ function MigratorApp() {
                   <div
                     className={`
                       p-4 rounded-xl border flex items-start gap-3
-                      ${testsPassed 
-                        ? "bg-emerald-950/30 border-emerald-800/50 text-emerald-400" 
-                        : hasError 
-                          ? "bg-red-950/30 border-red-800/50 text-red-400" 
+                      ${testsPassed
+                        ? "bg-emerald-950/30 border-emerald-800/50 text-emerald-400"
+                        : hasError
+                          ? "bg-red-950/30 border-red-800/50 text-red-400"
                           : "bg-amber-950/30 border-amber-800/50 text-amber-400"}
                     `}
                   >
@@ -1026,12 +1185,19 @@ function MigratorApp() {
                       )}
                     </div>
                     <div className="flex-1">
-                      <div className="font-medium">
-                        {testsPassed
-                          ? "Migration Successful"
-                          : hasError
-                            ? "Migration Failed"
-                            : "Migration Completed with Issues"}
+                      <div className="font-medium flex items-center gap-3">
+                        <span>
+                          {testsPassed
+                            ? "Migration Successful"
+                            : hasError
+                              ? "Migration Failed"
+                              : "Migration Completed with Issues"}
+                        </span>
+                        {confidence != null && (
+                          <span className="text-xs font-mono px-2 py-0.5 rounded-full bg-black/30 border border-current/30">
+                            {(confidence * 100).toFixed(1)}% confidence
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs opacity-70 mt-0.5">
                         {testsPassed
@@ -1040,13 +1206,12 @@ function MigratorApp() {
                             ? "An error occurred during migration"
                             : "Review the code and issues below"}
                       </div>
-                      
-                      {/* Show issues inline for partial status */}
+
                       {!testsPassed && !hasError && doneEvent?.payload?.issues && (
                         <div className="mt-3 space-y-1">
-                          {doneEvent.payload.issues.map((issue, i) => (
+                          {doneEvent.payload.issues.map((issue: string, i: number) => (
                             <div key={i} className="text-xs flex items-start gap-2 text-amber-300/80">
-                              <span className="text-amber-500">•</span>
+                              <span className="text-amber-500">&bull;</span>
                               <span>{issue}</span>
                             </div>
                           ))}

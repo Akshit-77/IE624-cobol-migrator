@@ -27,7 +27,8 @@ You are the planning component of a COBOL-to-Python migration agent. Your job is
 what action to take next based on the current state of the migration.
 
 ## Available Actions
-- ANALYZE: Analyze the COBOL source to understand its structure (do first if not done)
+- VALIDATE_COBOL: Compile and validate the input COBOL code (mandatory first step)
+- ANALYZE: Analyze the COBOL source to understand its structure (do after validation)
 - TRANSLATE: Generate a new Python translation of the COBOL code
 - GEN_TESTS: Generate pytest tests for the current Python draft
 - RUN_TESTS: Execute the generated tests against the current draft
@@ -36,8 +37,9 @@ what action to take next based on the current state of the migration.
 - FINISH: Complete the migration (use when tests pass or budget exhausted)
 
 ## Decision Guidelines
-1. If program_summary is not set, ANALYZE first
-2. If no drafts exist, TRANSLATE next
+1. If COBOL has NOT been validated yet, do VALIDATE_COBOL first (mandatory first step)
+2. If program_summary is not set, ANALYZE first
+3. If no drafts exist, TRANSLATE next
 3. After TRANSLATE, do GEN_TESTS then RUN_TESTS
 4. If tests FAIL, REFLECT to learn from the failure
 5. After REFLECT:
@@ -281,6 +283,23 @@ def planner(state: AgentState) -> dict[str, Any]:
     Includes hardcoded rules to prevent excessive API calls from test regeneration loops.
     """
     emit = state.get("emit", lambda t, p: None)
+
+    # COBOL must be validated before anything else
+    if not state.get("cobol_validated", False):
+        logger.info("COBOL not yet validated, forcing VALIDATE_COBOL")
+        emit(
+            "planner_decision",
+            {
+                "reasoning": "COBOL source must be validated before proceeding",
+                "next_action": "VALIDATE_COBOL",
+                "target_draft_id": None,
+                "step_count": state.get("step_count", 0),
+            },
+        )
+        return {
+            "next_action": "VALIDATE_COBOL",
+            "plan": "Validate COBOL source code first",
+        }
 
     # Check for external dependency - shortcut to FINISH
     if state.get("external_dependency_detected"):

@@ -93,12 +93,15 @@ def finalize(state: AgentState) -> dict[str, Any]:
         except Exception as e:
             logger.exception(f"Failed to save migration to database: {e}")
 
+    confidence = validation_scores.get("confidence")
+
     done_payload: dict[str, Any] = {
         "final_draft_id": current_draft_id,
         "total_drafts": len(drafts),
         "total_test_runs": len(test_runs),
         "final_test_passed": final_passed,
         "verdict": verdict,
+        "confidence": confidence,
         "step_count": state.get("step_count", 0),
         "validation_verdict": validation_verdict,
     }

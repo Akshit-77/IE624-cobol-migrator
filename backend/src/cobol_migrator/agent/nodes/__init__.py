@@ -8,6 +8,7 @@ from cobol_migrator.agent.nodes.reflect import reflect
 from cobol_migrator.agent.nodes.run_tests import run_tests
 from cobol_migrator.agent.nodes.translate import translate
 from cobol_migrator.agent.nodes.validate import validate
+from cobol_migrator.agent.nodes.validate_cobol import validate_cobol
 
 __all__ = [
     "analyze",
@@ -18,4 +19,5 @@ __all__ = [
     "run_tests",
     "translate",
     "validate",
+    "validate_cobol",
 ]

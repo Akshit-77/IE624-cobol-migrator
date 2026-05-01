@@ -5,7 +5,7 @@ export interface HealthResponse {
 }
 
 export interface MigrationRequest {
-  source_type: "snippet" | "url" | "repo";
+  source_type: "snippet" | "file";
   source_ref: string;
   step_budget?: number;
   create_dummy_files?: boolean;
@@ -61,12 +61,21 @@ export interface ErrorPayload {
   message: string;
 }
 
+export interface CobolValidationPayload {
+  passed: boolean;
+  message: string;
+  cobol_output?: string | null;
+  compiler_output?: string;
+  cobc_available?: boolean;
+}
+
 export interface DonePayload {
   final_draft_id?: string;
   total_drafts?: number;
   total_test_runs?: number;
   final_test_passed?: boolean;
   verdict?: string;
+  confidence?: number | null;
   step_count?: number;
   validation_verdict?: string;
   external_dependency?: boolean;
@@ -86,6 +95,7 @@ export type AgentEvent =
   | { type: "tests_generated"; payload: TestsGeneratedPayload; run_id: string }
   | { type: "test_run"; payload: TestRunPayload; run_id: string }
   | { type: "lesson_learned"; payload: LessonLearnedPayload; run_id: string }
+  | { type: "cobol_validation"; payload: CobolValidationPayload; run_id: string }
   | { type: "error"; payload: ErrorPayload; run_id: string }
   | { type: "cancelled"; payload: CancelledPayload; run_id: string }
   | { type: "done"; payload?: DonePayload; run_id: string };
@@ -113,6 +123,27 @@ export async function startMigration(
   return response.json() as Promise<MigrationStartResponse>;
 }
 
+export async function uploadAndMigrate(
+  file: File,
+  stepBudget: number = 25,
+  createDummyFiles: boolean = false
+): Promise<MigrationStartResponse> {
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("step_budget", String(stepBudget));
+  formData.append("create_dummy_files", String(createDummyFiles));
+
+  const response = await fetch(`${API_BASE}/api/migrations/upload`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to upload file: ${error}`);
+  }
+  return response.json() as Promise<MigrationStartResponse>;
+}
+
 export interface StopMigrationResponse {
   run_id: string;
   message: string;
@@ -130,6 +161,10 @@ export async function stopMigration(
     throw new Error(`Failed to stop migration: ${error}`);
   }
   return response.json() as Promise<StopMigrationResponse>;
+}
+
+export function getDownloadUrl(runId: string): string {
+  return `${API_BASE}/api/migrations/${runId}/download`;
 }
 
 export function subscribeEvents(

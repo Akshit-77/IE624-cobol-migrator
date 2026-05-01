@@ -6,7 +6,8 @@ from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
 NextAction = Literal[
-    "ANALYZE", "TRANSLATE", "GEN_TESTS", "RUN_TESTS", "VALIDATE", "REFLECT", "FINISH"
+    "VALIDATE_COBOL", "ANALYZE", "TRANSLATE", "GEN_TESTS", "RUN_TESTS",
+    "VALIDATE", "REFLECT", "FINISH",
 ]
 
 
@@ -57,9 +58,14 @@ class AgentState(TypedDict, total=False):
     """
 
     # Input
-    source_type: Literal["snippet", "url", "repo"]
+    source_type: Literal["snippet", "file"]
     source_ref: str
     cobol_source: str
+
+    # COBOL validation (runs before analysis)
+    cobol_validated: bool
+    cobol_output: str | None
+    cobc_available: bool
 
     # Analysis (Stage 3)
     program_summary: str | None
@@ -111,7 +117,7 @@ class AgentState(TypedDict, total=False):
 
 def create_initial_state(
     cobol_source: str,
-    source_type: Literal["snippet", "url", "repo"] = "snippet",
+    source_type: Literal["snippet", "file"] = "snippet",
     source_ref: str = "",
     step_budget: int = 25,
     emit: Callable[[str, dict[str, Any]], None] | None = None,
@@ -124,6 +130,9 @@ def create_initial_state(
         source_type=source_type,
         source_ref=source_ref,
         cobol_source=cobol_source,
+        cobol_validated=False,
+        cobol_output=None,
+        cobc_available=False,
         program_summary=None,
         io_contract=None,
         python_drafts=[],

@@ -8,9 +8,9 @@ from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from cobol_migrator.config import settings
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="COBOL Migrator API",
     description="Agentic COBOL to Python migration service",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -44,7 +44,7 @@ app.add_middleware(
 
 _active_runs: dict[str, asyncio.Queue[dict[str, Any]]] = {}
 _completed_runs: dict[str, dict[str, Any]] = {}
-_cancelled_runs: set[str] = set()  # Runs that should be cancelled
+_cancelled_runs: set[str] = set()
 
 
 class HealthResponse(BaseModel):
@@ -52,15 +52,12 @@ class HealthResponse(BaseModel):
 
 
 class MigrationRequest(BaseModel):
-    source_type: str = Field(description="One of: snippet, url, repo")
-    source_ref: str = Field(description="The COBOL source code or reference")
+    source_type: str = Field(description="One of: snippet, file")
+    source_ref: str = Field(description="The COBOL source code")
     step_budget: int = Field(default=25, description="Maximum planner iterations")
     create_dummy_files: bool = Field(
         default=False,
-        description=(
-            "If True, create dummy input files when external dependencies are detected. "
-            "If False, finish with partial verdict for external deps."
-        ),
+        description="If True, create dummy input files with synthetic data for testing.",
     )
 
 
@@ -95,6 +92,7 @@ class MigrationStatusResponse(BaseModel):
     final_code: str | None = None
     final_tests: str | None = None
     verdict: str | None = None
+    confidence: float | None = None
     validation: ValidationScores | None = None
     program_summary: str | None = None
 
@@ -136,7 +134,6 @@ async def _run_migration_task(
 ) -> None:
     """Background task that runs the migration and emits events to the queue."""
     from cobol_migrator.agent.graph import run_migration
-    from cobol_migrator.ingest import load_source
 
     def emit(event_type: str, payload: dict[str, Any]) -> None:
         event = {"type": event_type, "payload": payload, "run_id": run_id}
@@ -146,16 +143,11 @@ async def _run_migration_task(
             logger.warning(f"Event queue full for run {run_id}, dropping event")
 
     def check_cancelled() -> bool:
-        """Check if this run has been cancelled."""
         return run_id in _cancelled_runs
 
     try:
-        if source_type in ("url", "repo"):
-            cobol_source = load_source(source_type, source_ref)
-        else:
-            cobol_source = source_ref
+        cobol_source = source_ref
 
-        # Check for early cancellation before starting
         if check_cancelled():
             raise CancellationError("Migration cancelled before start")
 
@@ -171,7 +163,6 @@ async def _run_migration_task(
             check_cancelled=check_cancelled,
         )
 
-        # Check if it was cancelled during execution
         if check_cancelled():
             raise CancellationError("Migration was cancelled")
 
@@ -190,6 +181,7 @@ async def _run_migration_task(
             "verdict": validation_scores.get("verdict") or (
                 "passed" if test_runs and test_runs[-1].passed else "failed"
             ),
+            "confidence": validation_scores.get("confidence"),
             "validation": validation_scores,
             "program_summary": final_state.get("program_summary"),
         }
@@ -206,6 +198,7 @@ async def _run_migration_task(
             "final_code": None,
             "final_tests": None,
             "verdict": "cancelled",
+            "confidence": None,
             "validation": None,
             "program_summary": None,
         }
@@ -222,34 +215,26 @@ async def _run_migration_task(
             "final_code": None,
             "final_tests": None,
             "verdict": "errored",
+            "confidence": None,
             "validation": None,
             "program_summary": None,
         }
 
     finally:
-        # Clean up cancellation flag
         _cancelled_runs.discard(run_id)
         await queue.put({"type": "done", "run_id": run_id})
 
 
 @app.post("/api/migrations", response_model=MigrationStartResponse)
 async def start_migration(request: MigrationRequest) -> MigrationStartResponse:
-    """Start a new migration run."""
-    if request.source_type not in ("snippet", "url", "repo"):
-        raise HTTPException(status_code=400, detail="Invalid source_type")
+    """Start a new migration run from a code snippet."""
+    if request.source_type not in ("snippet", "file"):
+        raise HTTPException(status_code=400, detail="Invalid source_type. Must be 'snippet' or 'file'.")
 
     if len(request.source_ref) > 100000:
         raise HTTPException(status_code=400, detail="Source too large (max 100KB)")
 
-    if request.source_type == "repo":
-        if not request.source_ref.startswith("https://github.com/"):
-            raise HTTPException(
-                status_code=400,
-                detail="Only GitHub URLs are supported for repo source type"
-            )
-
     run_id = uuid4().hex
-
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1024)
     _active_runs[run_id] = queue
 
@@ -266,8 +251,49 @@ async def start_migration(request: MigrationRequest) -> MigrationStartResponse:
 
     message = "Migration started"
     if request.create_dummy_files:
-        message += " (dummy files will be created for external dependencies)"
+        message += " (dummy files with synthetic data will be created for testing)"
 
+    return MigrationStartResponse(run_id=run_id, message=message)
+
+
+@app.post("/api/migrations/upload", response_model=MigrationStartResponse)
+async def upload_and_migrate(
+    file: UploadFile = File(...),
+    step_budget: int = Form(default=25),
+    create_dummy_files: bool = Form(default=False),
+) -> MigrationStartResponse:
+    """Start a migration by uploading a COBOL file."""
+    if file.filename and not file.filename.lower().endswith((".cbl", ".cob", ".cobol", ".cpy", ".txt")):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Please upload a .cbl, .cob, .cobol, .cpy, or .txt file.",
+        )
+
+    content = await file.read()
+    if len(content) > 1_000_000:
+        raise HTTPException(status_code=400, detail="File too large (max 1MB)")
+
+    try:
+        source_ref = content.decode("utf-8")
+    except UnicodeDecodeError:
+        source_ref = content.decode("latin-1")
+
+    run_id = uuid4().hex
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1024)
+    _active_runs[run_id] = queue
+
+    asyncio.create_task(
+        _run_migration_task(
+            run_id=run_id,
+            source_type="file",
+            source_ref=source_ref,
+            step_budget=step_budget,
+            queue=queue,
+            create_dummy_files=create_dummy_files,
+        )
+    )
+
+    message = f"Migration started from uploaded file: {file.filename}"
     return MigrationStartResponse(run_id=run_id, message=message)
 
 
@@ -297,6 +323,28 @@ async def stop_migration(run_id: str) -> StopMigrationResponse:
         )
 
     raise HTTPException(status_code=404, detail="Run not found")
+
+
+@app.get("/api/migrations/{run_id}/download")
+async def download_python(run_id: str) -> Response:
+    """Download the generated Python code as a .py file."""
+    final_code = None
+
+    if run_id in _completed_runs:
+        final_code = _completed_runs[run_id].get("final_code")
+    else:
+        db_record = get_migration(run_id)
+        if db_record:
+            final_code = db_record.final_code
+
+    if not final_code:
+        raise HTTPException(status_code=404, detail="No generated code found for this run")
+
+    return Response(
+        content=final_code,
+        media_type="text/x-python",
+        headers={"Content-Disposition": f'attachment; filename="migrated_{run_id[:8]}.py"'},
+    )
 
 
 async def _event_generator(run_id: str) -> AsyncGenerator[str, None]:
@@ -382,6 +430,7 @@ def _record_to_response(record: MigrationRecord) -> MigrationStatusResponse:
         final_code=record.final_code,
         final_tests=record.final_tests,
         verdict=record.verdict,
+        confidence=record.validation.get("confidence") if record.validation else None,
         validation=validation,
         program_summary=record.program_summary,
     )
@@ -428,6 +477,7 @@ async def get_migration_status(run_id: str) -> MigrationStatusResponse:
             final_code=result.get("final_code"),
             final_tests=result.get("final_tests"),
             verdict=result.get("verdict"),
+            confidence=result.get("confidence"),
             validation=validation,
             program_summary=result.get("program_summary"),
         )
@@ -443,6 +493,7 @@ async def get_migration_status(run_id: str) -> MigrationStatusResponse:
             final_code=None,
             final_tests=None,
             verdict=None,
+            confidence=None,
             validation=None,
             program_summary=None,
         )

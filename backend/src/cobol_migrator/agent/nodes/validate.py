@@ -26,14 +26,12 @@ def _code_uses_file_io(python_code: str) -> bool:
 def validate(state: AgentState) -> dict[str, Any]:
     """
     Run the full validation stack on the current draft.
-    
-    Executes four independent validators:
-    - Differential: Compare COBOL and Python outputs
-    - Property: Hypothesis-based fuzzing (skipped for file-dependent programs)
-    - LLM Judge: Semantic equivalence assessment
-    - Static: Linting and structural checks
-    
-    Combines results into a verdict: equivalent, likely_equivalent, partial, broken
+
+    Flow:
+    1. COBOL was already validated and its output captured in validate_cobol step
+    2. Python tests were already run in run_tests step
+    3. Now compare outputs (differential) and run remaining validators
+    4. Combine into verdict with confidence score
     """
     emit = state.get("emit", lambda t, p: None)
 
@@ -47,8 +45,7 @@ def validate(state: AgentState) -> dict[str, Any]:
     python_code = current_draft.code
     cobol_source = state.get("cobol_source", "")
     io_contract = state.get("io_contract")
-    
-    # Check if dummy files were used (indicates file-dependent program)
+
     used_dummy_files = state.get("create_dummy_files", False)
     is_file_io_program = _code_uses_file_io(python_code)
 
@@ -59,8 +56,10 @@ def validate(state: AgentState) -> dict[str, Any]:
     judge_result = None
     static_result = None
 
+    # Differential: compare COBOL and Python outputs
+    # COBOL was already validated in the validate_cobol step
     try:
-        logger.info("Running differential validation...")
+        logger.info("Running differential validation (COBOL vs Python output comparison)...")
         differential_result = run_differential_validation(cobol_source, python_code)
         logger.info(
             f"Differential: available={differential_result.available}, "
@@ -69,8 +68,6 @@ def validate(state: AgentState) -> dict[str, Any]:
     except Exception as e:
         logger.exception(f"Differential validation error: {e}")
 
-    # Skip property-based validation for file-dependent programs
-    # Property tests run main() without input files, so they always fail for file I/O programs
     if is_file_io_program or used_dummy_files:
         logger.info(
             "Skipping property-based validation (file-dependent program requires input files)"

@@ -8,6 +8,9 @@ from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 
+import shutil
+from pathlib import Path
+
 from cobol_migrator.agent.nodes import (
     analyze,
     finalize,
@@ -17,6 +20,7 @@ from cobol_migrator.agent.nodes import (
     run_tests,
     translate,
     validate,
+    validate_cobol,
 )
 from cobol_migrator.agent.state import AgentState, NextAction, ToolCall
 from cobol_migrator.run_logger import RunLogger, create_logging_emit
@@ -24,6 +28,7 @@ from cobol_migrator.run_logger import RunLogger, create_logging_emit
 logger = logging.getLogger(__name__)
 
 ACTION_TO_NODE: dict[NextAction, str] = {
+    "VALIDATE_COBOL": "validate_cobol",
     "ANALYZE": "analyze",
     "TRANSLATE": "translate",
     "GEN_TESTS": "gen_tests",
@@ -134,6 +139,24 @@ def _wrap_node(
     return wrapped
 
 
+def _cleanup_test_runs() -> None:
+    """Remove all test_runs directories after migration completes."""
+    test_runs_dir = Path(__file__).resolve().parent.parent.parent.parent / "test_runs"
+    if test_runs_dir.exists():
+        try:
+            shutil.rmtree(test_runs_dir)
+            logger.info(f"Cleaned up test_runs directory: {test_runs_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup test_runs: {e}")
+
+
+def _route_after_cobol_validation(state: AgentState) -> str:
+    """Route after COBOL validation: finalize on error, continue otherwise."""
+    if state.get("error"):
+        return "finalize"
+    return "increment_step"
+
+
 def _increment_step(state: AgentState) -> dict[str, Any]:
     """Increment the step counter before each planner call."""
     return {"step_count": state.get("step_count", 0) + 1}
@@ -148,6 +171,7 @@ def build_graph(
 
     builder.add_node("increment_step", _increment_step)
     builder.add_node("planner", _wrap_node(planner, "planner", run_logger, check_cancelled))
+    builder.add_node("validate_cobol", _wrap_node(validate_cobol, "validate_cobol", run_logger, check_cancelled))
     builder.add_node("analyze", _wrap_node(analyze, "analyze", run_logger, check_cancelled))
     builder.add_node("translate", _wrap_node(translate, "translate", run_logger, check_cancelled))
     builder.add_node("gen_tests", _wrap_node(gen_tests, "gen_tests", run_logger, check_cancelled))
@@ -160,6 +184,12 @@ def build_graph(
     builder.add_edge("increment_step", "planner")
 
     builder.add_conditional_edges("planner", route_from_planner)
+
+    # validate_cobol routes to finalize on error, otherwise back to loop
+    builder.add_conditional_edges(
+        "validate_cobol",
+        _route_after_cobol_validation,
+    )
 
     for action_node in ["analyze", "translate", "gen_tests", "run_tests", "validate", "reflect"]:
         builder.add_edge(action_node, "increment_step")
@@ -248,6 +278,9 @@ def run_migration(
         final_state = dict(initial_state)
         final_state["error"] = str(e)
         final_state["done"] = True
+
+    # Clean up test_runs directory for this run
+    _cleanup_test_runs()
 
     drafts = final_state.get("python_drafts", [])
     test_runs = final_state.get("test_runs", [])
